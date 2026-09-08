@@ -10,9 +10,9 @@ use tokio::{
 
 use super::*;
 
-const MINT: &str = "6p6xgHyF7AeE6TZkSmFsko444wqoP15icUSqi2jfGiPN";
+pub(super) const MINT: &str = "6p6xgHyF7AeE6TZkSmFsko444wqoP15icUSqi2jfGiPN";
 
-fn candidate() -> TokenCandidate {
+pub(super) fn candidate() -> TokenCandidate {
     TokenCandidate {
         contract_address: MINT.into(),
         discovered_at: Utc::now(),
@@ -318,4 +318,80 @@ async fn live_read_only_token_info() {
     println!("Live GMGN fields: price={}, market_cap={}, liquidity={}, volume_5m={}, volume_1h={}, created_at={}",
         snapshot.price_usd.is_some(), snapshot.market_cap_usd.is_some(), snapshot.liquidity_usd.is_some(),
         snapshot.volume_5m_usd.is_some(), snapshot.volume_1h_usd.is_some(), snapshot.created_at.is_some());
+}
+
+#[tokio::test]
+async fn batch_uses_one_post_with_no_address_filters_or_per_token_fallback() {
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let capture = seen.clone();
+    let app = Router::new().route("/v1/trenches", axum::routing::post(move |request: Request<Body>| {
+        let capture = capture.clone();
+        async move {
+            let (parts, body) = request.into_parts();
+            assert_eq!(parts.headers["x-apikey"], "fake-test-key");
+            assert!(!parts.headers.contains_key("x-signature"));
+            let url = reqwest::Url::parse(&format!("http://localhost{}", parts.uri)).unwrap();
+            let query: std::collections::HashMap<_,_> = url.query_pairs().collect();
+            assert_eq!(query["chain"], "sol");
+            assert!(!query.contains_key("address"));
+            Uuid::parse_str(&query["client_id"]).unwrap();
+            let body = axum::body::to_bytes(body, 65536).await.unwrap();
+            let body: Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(body["new_creation"]["limit"], 80);
+            assert!(body["new_creation"].get("min_marketcap").is_none());
+            assert!(body["new_creation"].get("sort_by").is_none());
+            assert_eq!(body, trenches::request_body());
+            capture.lock().unwrap().push(body);
+            axum::Json(json!({"code":0,"data":{"new_creation":[{"address":MINT,"price":0.5,"market_cap":500}]}}))
+        }
+    }));
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let mut provider = GmgnMarketDataProvider::new("fake-test-key".into()).unwrap();
+    provider.trenches_endpoint = format!("http://{}/v1/trenches", listener.local_addr().unwrap());
+    // A fallback to token/info would fail rather than contact the real API.
+    provider.endpoint = "http://127.0.0.1:1/v1/token/info".into();
+    let task = tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    let mut missing = candidate();
+    missing.contract_address = "So11111111111111111111111111111111111111112".into();
+    let result = provider
+        .fetch_markets(&[candidate(), candidate(), missing])
+        .await
+        .unwrap();
+    assert_eq!(result.len(), 1);
+    assert_eq!(seen.lock().unwrap().len(), 1);
+    assert!(provider.fetch_markets(&[]).await.unwrap().is_empty());
+    assert_eq!(seen.lock().unwrap().len(), 1);
+    task.abort();
+}
+
+#[tokio::test]
+#[ignore = "requires GMGN_API_KEY; one read-only Trenches request"]
+async fn live_read_only_trenches() {
+    let key = std::env::var("GMGN_API_KEY").expect("set GMGN_API_KEY for explicit live testing");
+    let mut provider = GmgnMarketDataProvider::new(key).unwrap();
+    let data = provider.request_json(true, None).await.unwrap();
+    let mut candidates = Vec::new();
+    for category in ["new_creation", "pump", "near_completion", "completed"] {
+        for row in data
+            .get(category)
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+        {
+            if let Some(address) = text(row.get("address")) {
+                let mut candidate = candidate();
+                candidate.contract_address = address;
+                candidates.push(candidate);
+            }
+        }
+    }
+    assert!(!candidates.is_empty());
+    let snapshots = trenches::normalize(&data, &candidates).unwrap();
+    assert!(!snapshots.is_empty());
+    println!("Trenches: 1 request, {} rows, {} unique mints normalized; price={}, cap={}, holders={}, top10={}, creator={}, volume1h={}", candidates.len(), snapshots.len(),
+        snapshots.iter().filter(|s| s.price_usd.is_some()).count(), snapshots.iter().filter(|s| s.market_cap_usd.is_some()).count(),
+        snapshots.iter().filter(|s| s.holders.is_some()).count(), snapshots.iter().filter(|s| s.top_10_holder_pct.is_some()).count(),
+        snapshots.iter().filter(|s| s.creator_holder_pct.is_some()).count(), snapshots.iter().filter(|s| s.volume_1h_usd.is_some()).count());
 }

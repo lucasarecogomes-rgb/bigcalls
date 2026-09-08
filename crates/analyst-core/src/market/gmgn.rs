@@ -19,6 +19,8 @@ use super::{MarketDataError, MarketDataProvider};
 use crate::{discovery::TokenCandidate, MarketSnapshot};
 
 const ENDPOINT: &str = "https://openapi.gmgn.ai/v1/token/info";
+const TRENCHES_ENDPOINT: &str = "https://openapi.gmgn.ai/v1/trenches";
+mod trenches;
 const REQUEST_INTERVAL: Duration = Duration::from_millis(250);
 const ERROR_COOLDOWN: Duration = Duration::from_secs(5);
 const DEFAULT_RATE_COOLDOWN: Duration = Duration::from_secs(60);
@@ -26,6 +28,7 @@ const DEFAULT_RATE_COOLDOWN: Duration = Duration::from_secs(60);
 pub struct GmgnMarketDataProvider {
     client: Client,
     endpoint: String,
+    trenches_endpoint: String,
     next_request_at: Instant,
 }
 
@@ -51,6 +54,7 @@ impl GmgnMarketDataProvider {
         Ok(Self {
             client,
             endpoint: ENDPOINT.into(),
+            trenches_endpoint: TRENCHES_ENDPOINT.into(),
             next_request_at: Instant::now(),
         })
     }
@@ -63,17 +67,34 @@ impl GmgnMarketDataProvider {
         if !valid_solana_address(address) {
             return Err(MarketDataError::InvalidCandidate);
         }
+        let envelope = self.request_json(false, Some(address)).await?;
+        normalize_token(&envelope, address)
+    }
+
+    async fn request_json(
+        &mut self,
+        batch: bool,
+        address: Option<&str>,
+    ) -> Result<Value, MarketDataError> {
         sleep_until(self.next_request_at).await;
         self.next_request_at = Instant::now() + REQUEST_INTERVAL;
-        let response = self
-            .client
-            .get(&self.endpoint)
-            .query(&[
-                ("chain", "sol".to_owned()),
-                ("address", address.to_owned()),
-                ("timestamp", Utc::now().timestamp().to_string()),
-                ("client_id", Uuid::new_v4().to_string()),
-            ])
+        let request = if batch {
+            self.client
+                .post(&self.trenches_endpoint)
+                .json(&trenches::request_body())
+        } else {
+            self.client.get(&self.endpoint)
+        };
+        let mut query = vec![
+            ("chain", "sol".to_owned()),
+            ("timestamp", Utc::now().timestamp().to_string()),
+            ("client_id", Uuid::new_v4().to_string()),
+        ];
+        if let Some(address) = address {
+            query.push(("address", address.to_owned()));
+        }
+        let response = request
+            .query(&query)
             .send()
             .await
             .map_err(transport_error)?;
@@ -118,22 +139,14 @@ impl GmgnMarketDataProvider {
             Some(_) => return Err(MarketDataError::ProviderRejected),
             None => return Err(MarketDataError::InvalidResponse),
         }
-        normalize_token(
-            envelope
-                .get("data")
-                .ok_or(MarketDataError::InvalidResponse)?,
-            address,
-        )
+        envelope
+            .get("data")
+            .cloned()
+            .ok_or(MarketDataError::InvalidResponse)
     }
-}
 
-impl MarketDataProvider for GmgnMarketDataProvider {
-    async fn fetch_market(
-        &mut self,
-        candidate: &TokenCandidate,
-    ) -> Result<MarketSnapshot, MarketDataError> {
-        let result = self.request(candidate).await;
-        let cooldown = match &result {
+    fn apply_cooldown<T>(&mut self, result: &Result<T, MarketDataError>) {
+        let cooldown = match result {
             Err(MarketDataError::RateLimited { retry_after }) => Some(*retry_after),
             Err(
                 MarketDataError::Timeout
@@ -147,6 +160,37 @@ impl MarketDataProvider for GmgnMarketDataProvider {
         if let Some(delay) = cooldown {
             self.next_request_at = Instant::now() + delay;
         }
+    }
+}
+
+impl MarketDataProvider for GmgnMarketDataProvider {
+    async fn fetch_market(
+        &mut self,
+        candidate: &TokenCandidate,
+    ) -> Result<MarketSnapshot, MarketDataError> {
+        let result = self.request(candidate).await;
+        self.apply_cooldown(&result);
+        result
+    }
+
+    async fn fetch_markets(
+        &mut self,
+        candidates: &[TokenCandidate],
+    ) -> Result<Vec<MarketSnapshot>, MarketDataError> {
+        if candidates.is_empty() {
+            return Ok(Vec::new());
+        }
+        if !candidates
+            .iter()
+            .any(|candidate| valid_solana_address(candidate.contract_address.trim()))
+        {
+            return Err(MarketDataError::InvalidCandidate);
+        }
+        let result = self
+            .request_json(true, None)
+            .await
+            .and_then(|data| trenches::normalize(&data, candidates));
+        self.apply_cooldown(&result);
         result
     }
 }

@@ -11,11 +11,22 @@ pub trait MarketDataProvider: Send {
         &mut self,
         candidate: &TokenCandidate,
     ) -> impl Future<Output = Result<MarketSnapshot, MarketDataError>> + Send;
+
+    /// A single provider batch request. Missing candidates are omitted, never
+    /// retried automatically through the single-token method.
+    fn fetch_markets(
+        &mut self,
+        _candidates: &[TokenCandidate],
+    ) -> impl Future<Output = Result<Vec<MarketSnapshot>, MarketDataError>> + Send {
+        async { Err(MarketDataError::BatchUnsupported) }
+    }
 }
 
 /// Safe to log: excludes credentials, request headers and raw provider bodies.
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 pub enum MarketDataError {
+    #[error("market provider does not support batch enrichment")]
+    BatchUnsupported,
     #[error("GMGN_API_KEY is missing or invalid")]
     InvalidCredentials,
     #[error("market provider client could not be initialized")]

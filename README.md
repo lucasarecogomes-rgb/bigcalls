@@ -74,82 +74,117 @@ analysis decisions. `/analyze` and the J7 ingestion flow retain their existing c
 
 ## Market enrichment (GMGN)
 
-`TokenSource` and `MarketDataProvider` are separate interfaces. The first yields
-`TokenCandidate`; the second fetches a `MarketSnapshot` for that candidate.
-`MarketSnapshot` adds an optional `priceUsd`. Existing `/analyze` requests remain
-valid and its responses omit `priceUsd` when it is absent.
+`TokenSource` remains independent of `MarketDataProvider`. Automatic enrichment
+now uses `fetch_markets` (one batch request). The existing `fetch_market` /
+`token/info` implementation remains available for explicit future point queries;
+the worker never invokes it or falls back to it for missing candidates.
 
-With discovery enabled, set your own `GMGN_API_KEY` in the local `.env` to enable
-enrichment. An empty/missing key leaves discovery running on its own. The API key
-is the only new setting: provider URLs, pacing and timeouts stay in code. No private
-key is used. Never commit `.env` or credentials.
+With discovery enabled, configure your own `GMGN_API_KEY` in local `.env`.
+Credentials are the only provider setting. No private key is needed. The fixed
+PumpPortal endpoint, J7, candidate JSONL retention and `/analyze` are unchanged.
 
-The official API and its authentication were checked on 2026-09-08 against
-GMGN's published client at commit `aa4d29a9b7d1aaaac3d6acd72c13f17575605348`:
+### Verified official Trenches contract
 
-- [Token-info route and API-key header](https://github.com/GMGNAI/gmgn-skills/blob/aa4d29a9b7d1aaaac3d6acd72c13f17575605348/src/client/OpenApiClient.ts):
-  `GET https://openapi.gmgn.ai/v1/token/info?chain=sol&address=<mint>&timestamp=<unix-seconds>&client_id=<uuid>`;
-  header `X-APIKEY`. This read-only route does not use `X-Signature`.
-- [Authentication parameters](https://github.com/GMGNAI/gmgn-skills/blob/aa4d29a9b7d1aaaac3d6acd72c13f17575605348/src/client/signer.ts):
-  fresh UUID per request and a clock within five seconds of server time.
-- [Official authentication overview](https://docs.gmgn.ai/cn/gmgn-agent-api):
-  read-only token queries need an API key, and requests require IPv4.
-- [Token response field reference](https://github.com/GMGNAI/gmgn-skills/blob/aa4d29a9b7d1aaaac3d6acd72c13f17575605348/skills/gmgn-token/SKILL.md).
+Verified on 2026-09-08 against GMGN's official client/docs at commit
+`aa4d29a9b7d1aaaac3d6acd72c13f17575605348`:
 
-One token-info request provides the following mapping, when its fields are present:
+- [Route, request body and auth](https://github.com/GMGNAI/gmgn-skills/blob/aa4d29a9b7d1aaaac3d6acd72c13f17575605348/src/client/OpenApiClient.ts):
+  `POST https://openapi.gmgn.ai/v1/trenches?chain=sol&timestamp=<unix-seconds>&client_id=<uuid>`,
+  with `X-APIKEY` and a JSON body. This POST queries market data; it does not trade.
+- [Timestamp/UUID](https://github.com/GMGNAI/gmgn-skills/blob/aa4d29a9b7d1aaaac3d6acd72c13f17575605348/src/client/signer.ts):
+  fresh UUID per request, clock within five seconds of the server.
+- [Parameters, limits and field semantics](https://github.com/GMGNAI/gmgn-skills/blob/aa4d29a9b7d1aaaac3d6acd72c13f17575605348/skills/gmgn-market/SKILL.md):
+  three categories, documented maximum 80 results per category, route weight 3
+  in the documented rate-20/capacity-20 limiter.
 
-| Snapshot field | GMGN field / normalization |
+The body uses `version: "v2"` and `new_creation`, `near_completion`, `completed`
+sections, each with `limit: 80`, `filters: ["offchain", "onchain"]`,
+`launchpad_platform_v2: true`, and the official Solana quote-address types.
+Only the documented Pump.fun platform family is requested:
+`Pump.fun`, `pump_mayhem`, `pump_mayhem_agent`, `pump_agent`.
+There are no safety presets, market thresholds, custom sorting or ranking.
+
+**Observed differences:** the live API returned 60 rows per category despite
+requesting 80, and used `near_completion` where documentation calls the response
+key `pump`. The adapter supports both category names. Live rows use `market_cap`,
+documented as USD in the shared RankItem reference, while the Trenches table also
+documents `usd_market_cap`. Both aliases are accepted. Do not treat the
+documented 80 as a guaranteed number of results.
+
+### Batching and coverage
+
+`Pump.fun -> persist TokenCandidate -> buffer (up to 80 / 5 seconds) -> one Trenches request -> exact mint join -> MarketSnapshot`
+
+The buffer flushes when full or five seconds after its first candidate. It makes
+no requests while empty. The existing 256-entry input queue stays nonblocking:
+a full queue skips enrichment for that candidate but preserves its discovery record.
+
+Trenches is a recent-token feed, **not a bulk lookup accepting our mint list**.
+The adapter joins only exact requested Solana addresses, deduplicates repeated
+rows and ignores all unrelated tokens. Only matched snapshots append to
+`data/market-snapshots.jsonl`, with discovery and fetch times.
+Missing candidates remain in `data/token-candidates.jsonl`. There are no
+automatic per-token fallbacks, retries, pagination guesses or refresh loops.
+Feed coverage is partial: indexing lag, bursts and downtime can cause misses.
+
+For 100 candidates already queued: **100 calls before, 2 calls now** (80 + 20),
+a 98% request reduction. This is not a promise to enrich all 100: only feed matches
+produce snapshots. With arrivals spread out, cost is one call per nonempty
+five-second window (or full batch); sparse arrivals can still mean one call per
+candidate. On limiter weight, two Trenches calls cost 6 units versus 100 token-info
+calls at weight 1. No extra requests are issued to fill coverage gaps.
+
+A real read-only cross-source check collected 3 new PumpPortal mints and matched
+all 3 in one Trenches request. This demonstrates matching, not complete feed coverage.
+
+### Metrics mapped
+
+| MarketSnapshot field | Documented Trenches/RankItem field |
 | --- | --- |
-| `contractAddress` | `address`, checked against the requested mint |
-| `symbol`, `name` | `symbol`, `name` |
-| `priceUsd` | `price.price` |
-| `marketCapUsd` | `price.price * circulating_supply`, as documented by GMGN; no total-supply/FDV substitution |
-| `liquidityUsd` | `liquidity`, or the documented `pool.liquidity` when unavailable |
-| `volume5mUsd`, `volume1hUsd` | `price.volume_5m`, `price.volume_1h` |
-| `createdAt` | Token `creation_timestamp` in Unix seconds; never pool/open/discovery time |
+| `contractAddress`, `name`, `symbol` | `address`, `name`, `symbol` |
+| `priceUsd` | `price` (USD) |
+| `marketCapUsd` | `market_cap`, or `usd_market_cap` |
+| `liquidityUsd` | `liquidity` |
+| `volume1hUsd` | `volume_1h`, only when present; absent in the live sample |
+| `createdAt` | `created_timestamp` (Unix seconds), never open/completion/discovery time |
+| `holders` | `holder_count` |
+| `top10HolderPct` | `top_10_holder_rate * 100` |
+| `creatorHolderPct` | `creator_balance_rate * 100`, not the broader dev-team metric |
+| `mintAuthorityRevoked` | `renounced_mint` |
+| `freezeAuthorityRevoked` | `renounced_freeze_account` |
 
-Numeric strings and JSON numbers are accepted. Missing, invalid, negative or
-non-finite values remain `None`; zero remains zero. Market cap remains `None` if
-price or circulating supply is missing. Creation time remains `None` when absent,
-invalid or in the future. Age can later be computed from `createdAt`; it is not
-guessed from discovery time. Holder/risk fields are not mapped by this market layer.
+`volume5mUsd` stays `None`: the Trenches documentation does not establish that
+window. Neither 24h volume nor a generic interval volume is substituted.
+`sniperHolderPct` stays `None`: sniper wallet counts and the top-70 subset's
+holdings are not overall sniper holdings.
+`bundledHolderPct` stays `None`: bundler trading-volume ratios are not holding
+ratios. No new fields are created for scores or unrelated risk/social metrics.
 
-The runtime flow is:
+Missing, malformed, negative/non-finite numbers and invalid ratios stay `None`;
+zero is preserved. Ratios must be 0–1 before conversion to percent. No LLM or
+analysis prefilter is invoked. Snapshot source is `gmgn:trenches`.
 
-`Pump.fun discovery -> persist TokenCandidate -> bounded FIFO queue -> MarketDataProvider -> MarketSnapshot -> data/market-snapshots.jsonl`
+### Failure handling and verification
 
-Each market history record contains `discoveredAt`, local `fetchedAt`, and `market`.
-The existing candidate JSONL path, append behavior and deduplication are unchanged.
-Only candidates accepted by discovery's existing deduplication enter the queue.
-There is one market worker, at least 250 ms between requests, one request per
-candidate attempt, and no automatic per-token retries or periodic refreshes.
+The provider retains its 5-second connection and 10-second overall timeouts,
+minimum 250 ms request spacing, and shared error/cooldown handling.
+Rate limits honor the latest `X-RateLimit-Reset`, `reset_at`, or `Retry-After`
+plus a one-second buffer (61 seconds by default; implausible values capped at one
+day plus buffer). No requests occur during cooldown. A failed batch is logged
+and left in candidate history; subsequent batches can proceed.
+Authentication or market-history storage failure stops only the market worker.
 
-The queue holds 256 candidates. If full, enrichment for that candidate is skipped
-and logged; its discovery record remains intact. This is a scheduling bound, not
-a ranking or market filter. Slow market requests never block candidate persistence.
-
-Requests have a 5-second connection timeout and a 10-second overall timeout.
-HTTP/API rate limits respect the latest `X-RateLimit-Reset`, body `reset_at`, or
-`Retry-After`, plus a one-second buffer (61 seconds by default; implausible values
-are capped at one day plus the buffer). No further requests are sent during that
-cooldown. Other provider/network failures are logged and impose a short cooldown;
-the next queued candidate can still be processed. Authentication or market-history
-storage failures stop only the market worker. Discovery and HTTP remain available.
-Failed/unindexed tokens have no market snapshot; automatic reevaluation is a later step.
-
-This stage does not invoke `/analyze`, the prefilter or the LLM, and does not process
-social data, rank tokens or trade. PumpPortal's fixed endpoint and candidate-history
-retention remain unchanged.
-
-Offline verification: `cargo fmt --check`, `cargo check --workspace`, and
-`cargo test --workspace`. An explicit, ignored live test makes one read-only request
-using `GMGN_API_KEY` from the process environment:
+Offline checks: `cargo fmt --check`, `cargo check --workspace`,
+`cargo test --workspace`. Explicit read-only tests require `GMGN_API_KEY` in the
+process environment:
 
 ```bash
-cargo test -p analyst-core live_read_only_token_info -- --ignored --nocapture
+cargo test --workspace live_read_only_trenches -- --ignored --nocapture
+cargo test --workspace live_read_only_token_info -- --ignored --nocapture
 ```
 
-No API key, including the provider's public demo key, is embedded in the code or tests.
+The second command tests the preserved point-query adapter; it is not an
+automatic fallback. No real or demo API key is embedded in repository files.
 
 ## Market snapshot
 
