@@ -1,84 +1,132 @@
 # BIGCALLS
 
-BIGCALLS e um analisador pessoal de memecoins da Solana, executado localmente. O objetivo do MVP e reduzir o trabalho manual de pesquisa: coletar dados, eliminar lixo evidente, organizar contexto de mercado/social/on-chain e entregar esse contexto para uma IA interpretar.
+Personal Solana AI analyst. Local-only, analysis-only.
 
-Nao e um bot de execucao. O projeto nao possui wallet, buy/sell, gerenciamento de posicoes, copy trade, painel comercial, assinaturas, multiusuario ou qualquer fluxo que movimente fundos.
+## Scope
 
-## Regra de arquitetura
+BIGCALLS is the base for the MVP we defined:
 
-O codigo faz o trabalho deterministico: coleta, normalizacao, historico, metricas e filtros basicos de seguranca. A IA faz o trabalho contextual: entender mercado, narrativa, tendencia, atividade social, influencia e decidir o que merece atencao.
+1. receive/discover new Solana tokens;
+2. collect and normalize basic market/on-chain metrics;
+3. reject only obvious trash/rug conditions;
+4. correlate social activity and narratives;
+5. let the LLM interpret context instead of replacing analysis with fixed scores;
+6. classify opportunities as `IGNORE`, `OBSERVE` or `RESEARCH`;
+7. preserve local analysis history for future memory/context.
 
-O filtro deterministico deve ser pequeno. Ele existe para descartar lixo/rug obvio, nao para substituir a IA por uma tabela de pontos.
+It does not manage wallets, execute trades, manage positions, provide subscriptions, admin panels, Telegram UI or multi-user product features.
 
-## Fluxo-alvo do MVP
+## Current components
 
-1. Descobrir tokens novos/ativos na Solana.
-2. Coletar primeiro o contexto de mercado: market cap, liquidez, volume, idade e atividade.
-3. Coletar sinais on-chain basicos: holders, concentracao, creator, snipers/bundles e authorities quando disponivel.
-4. Correlacionar sinais sociais e narrativas. O J7 Bridge continua como fonte inicial; outras fontes podem entrar depois.
-5. Aplicar apenas o pre-filtro de risco obvio.
-6. Enviar o pacote consolidado para a IA.
-7. Classificar como `IGNORE`, `OBSERVE` ou `RESEARCH`, com tese, riscos, dados faltantes e proximas verificacoes.
-8. Salvar historico local para permitir memoria e comparacao temporal nas proximas fases.
+- `crates/app`: local HTTP runtime.
+- `crates/analyst-core`: normalized inputs, basic prefilter, AI reasoning and local JSONL history.
+- `j7-bridge`: local browser collector for J7Tracker social events.
 
-## Estrutura atual
-
-```text
-crates/
-  app/             API/orquestracao local
-  analyst-core/    tipos, pre-filtro, cliente LLM e historico JSONL
-j7-bridge/
-  extension/       captura sinais do J7Tracker no navegador
-  bridge-server/   relay local opcional
-```
-
-Todo o codigo antigo de wallet, execucao, posicoes, Telegram, admin, assinaturas, Jupiter, Helius sender e infraestrutura multiusuario foi removido desta base.
-
-## Endpoints atuais
+## API
 
 `GET /health`
 
-Retorna o estado basico do processo local.
+Returns the local service status.
 
 `POST /webhooks/social/j7`
 
-Recebe e salva eventos do J7. O evento social isolado nao gera uma decisao de investimento; ele vira contexto para ser correlacionado com o token.
+Receives a J7 social event. The event is preserved as social evidence. A social event by itself is not treated as sufficient evidence for a token decision; it must later be correlated with market/on-chain context.
 
-`POST /analyze`
+`POST /analyze/market`
 
-Recebe um `market` obrigatorio e uma lista opcional de eventos `social`. O mercado passa primeiro pelo filtro basico e, se nao for rejeitado, o pacote consolidado vai para a IA.
+Receives a normalized market snapshot and runs the obvious-trash prefilter before optional LLM interpretation.
 
-Exemplo minimo:
+## Market snapshot
+
+The MVP input is intentionally small and can grow as collectors are implemented:
 
 ```json
 {
-  "market": {
-    "contractAddress": "TOKEN_MINT",
-    "symbol": "ABC",
-    "marketCapUsd": 250000,
-    "liquidityUsd": 42000,
-    "volume5mUsd": 18000,
-    "holders": 850,
-    "top10HolderPct": 31.2,
-    "creatorHolderPct": 2.1,
-    "sniperHolderPct": 8.4
-  },
-  "social": []
+  "contractAddress": "SOLANA_MINT",
+  "symbol": "TOKEN",
+  "name": "Token Name",
+  "marketCapUsd": 250000,
+  "liquidityUsd": 45000,
+  "volume5mUsd": 12000,
+  "volume1hUsd": 90000,
+  "holders": 850,
+  "top10HolderPct": 26.0,
+  "creatorHolderPct": 1.8,
+  "sniperHolderPct": 7.0,
+  "bundledHolderPct": 3.0,
+  "mintAuthorityRevoked": true,
+  "freezeAuthorityRevoked": true,
+  "source": "collector"
 }
 ```
 
-## Configuracao
+The prefilter exists only to remove obvious bad conditions. It should not become a rigid trading strategy. Narrative strength, timing, influence, social context and missing information belong to the AI reasoning layer.
 
-Copie `.env.example` para `.env` e configure a chave/modelo de IA quando quiser ativar a camada LLM.
+## AI output
+
+When `OPENAI_API_KEY` is configured, the analyst returns:
+
+```json
+{
+  "verdict": "IGNORE|OBSERVE|RESEARCH",
+  "confidence": 0,
+  "narrative": null,
+  "thesis": "...",
+  "positives": [],
+  "risks": [],
+  "missingData": [],
+  "nextChecks": []
+}
+```
+
+The model is explicitly instructed not to invent missing data and not to make decisions from fixed score thresholds alone.
+
+## Local storage
+
+Analysis records are appended to `data/analysis-history.jsonl` by default. `data/` stays out of Git.
+
+For the MVP this is simpler and safer than carrying the previous PostgreSQL/multi-user product stack. A structured database can be introduced later when the history/queries justify it.
+
+## Configuration
 
 ```bash
+cp .env.example .env
+```
+
+Then configure the local bind address and, when desired, the LLM API key/model.
+
+## Run
+
+```bash
+cargo check
 cargo run -p app
 ```
 
-Historicos locais sao gravados em `data/` e nao entram no Git.
+The service binds to `127.0.0.1:8790` by default.
 
-## Proximas camadas
+## J7 collector
 
-A base ainda precisa dos adapters que vao alimentar automaticamente o `MarketSnapshot`: descoberta de tokens, dados de mercado e enriquecimento on-chain. Depois entra a correlacao automatica entre o historico social, narrativas em tendencia e os tokens descobertos.
+The existing J7 browser collector was preserved because it is useful for the social/narrative layer.
 
-A prioridade permanece: mercado primeiro, depois narrativa/social, depois aprofundamento on-chain e memoria temporal.
+```bash
+cd j7-bridge/extension
+npm install
+npm run check
+npm run build
+```
+
+Load the extension as unpacked in Chrome/Edge and keep J7Tracker open. The extension forwards normalized social events to the local BIGCALLS backend.
+
+The optional relay remains in `j7-bridge/bridge-server`.
+
+## Next implementation priorities
+
+1. new-token discovery on Solana;
+2. market/liquidity/volume collector;
+3. holder/concentration/basic rug collector;
+4. correlation of token + social events;
+5. narrative discovery and influence analysis;
+6. LLM context assembly;
+7. local historical memory and reevaluation of observed tokens.
+
+This repository is intentionally a small base for those steps, not a finished trading bot.
