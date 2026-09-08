@@ -146,3 +146,11 @@ User workflow preference: always commit completed project changes after the rele
 - Use only documented equivalent fields: direct USD market cap, price, liquidity, documented 1h volume if present, creation time, holder count, top-10 and creator holding ratios converted to percent, and mint/freeze authorities. Missing data stays `None`. Do not map bundler trading volume or top-70 sniper holdings into overall holder percentages. See README for official references, live response differences and precise field mapping.
 - Rate limits/timeouts/provider errors must not stop discovery or HTTP. Do not send repeated requests during cooldown. Authentication failure stops market requests; candidates remain preserved. No automatic per-token retries, ranking, thresholds, social processing or AI calls are part of this stage.
 - Preserve the fixed PumpPortal address and the current storage/retention strategy of `data/token-candidates.jsonl`; evaluate any changes to those separately later.
+
+## Implemented discovery prefilter
+
+- After exact-mint matching and deduplication, the market worker calls the existing `analyst_core::prefilter` with the application's shared `AnalystConfig` values. Keep provider normalization separate from this step; do not add rules or thresholds.
+- Each market-history record preserves the unmodified normalized `market` and adds `status` (`ACCEPTED`/`REJECTED`) plus the original `prefilter` result (`rejected`, `reasons`, `warnings`). Missing provider fields remain absent and cannot alone cause rejection.
+- Existing hard rejects only cover low liquidity and excessive top-10, creator or sniper holdings when available. Active mint/freeze authorities are warnings only. No market-cap filter, scoring or ranking.
+- Rejected records stop at the worker gate. Accepted records are merely eligible for later stages; no downstream social/J7/on-chain/narrative/AI work runs yet. Future consumers must require explicit `ACCEPTED`; legacy records without status are unevaluated.
+- Do not rewrite historical records, change candidate storage or provider batching, or alter `/analyze` behavior for this integration.

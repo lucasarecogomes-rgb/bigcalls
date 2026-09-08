@@ -1,7 +1,7 @@
 use analyst_core::{
     discovery::TokenCandidate,
     market::{MarketDataError, MarketDataProvider},
-    JsonlStore, MarketSnapshot,
+    prefilter, AnalystConfig, JsonlStore, MarketSnapshot, PrefilterResult,
 };
 use chrono::{DateTime, Utc};
 use serde::Serialize;
@@ -21,20 +21,31 @@ struct MarketEnrichmentRecord {
     discovered_at: DateTime<Utc>,
     fetched_at: DateTime<Utc>,
     market: MarketSnapshot,
+    status: PrefilterStatus,
+    prefilter: PrefilterResult,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+enum PrefilterStatus {
+    Accepted,
+    Rejected,
 }
 
 pub async fn run(
     provider: impl MarketDataProvider,
     candidates: Receiver<TokenCandidate>,
     store: JsonlStore,
+    config: AnalystConfig,
 ) -> anyhow::Result<()> {
-    run_batches(provider, candidates, store, BATCH_WINDOW).await
+    run_batches(provider, candidates, store, config, BATCH_WINDOW).await
 }
 
 async fn run_batches(
     mut provider: impl MarketDataProvider,
     mut candidates: Receiver<TokenCandidate>,
     store: JsonlStore,
+    config: AnalystConfig,
     window: Duration,
 ) -> anyhow::Result<()> {
     while let Some(first) = candidates.recv().await {
@@ -61,12 +72,24 @@ async fn run_batches(
                     if !saved.insert(market.contract_address.clone()) {
                         continue;
                     }
+                    let prefilter = prefilter(&market, &config);
+                    let status = if prefilter.rejected {
+                        PrefilterStatus::Rejected
+                    } else {
+                        PrefilterStatus::Accepted
+                    };
                     let record = MarketEnrichmentRecord {
                         discovered_at: candidate.discovered_at,
                         fetched_at,
                         market,
+                        status,
+                        prefilter,
                     };
                     store.append(&record).await?;
+                    if record.prefilter.rejected {
+                        continue;
+                    }
+                    // ACCEPTED is eligible for future enrichment only. No downstream work yet.
                 }
                 info!(
                     candidates = batch.len(),
@@ -153,6 +176,141 @@ mod tests {
         ))
     }
 
+    struct SnapshotProvider(Vec<MarketSnapshot>);
+
+    impl MarketDataProvider for SnapshotProvider {
+        async fn fetch_market(
+            &mut self,
+            _: &TokenCandidate,
+        ) -> Result<MarketSnapshot, MarketDataError> {
+            panic!("point queries must not run during prefiltering");
+        }
+
+        async fn fetch_markets(
+            &mut self,
+            _: &[TokenCandidate],
+        ) -> Result<Vec<MarketSnapshot>, MarketDataError> {
+            Ok(std::mem::take(&mut self.0))
+        }
+    }
+
+    #[tokio::test]
+    async fn persists_raw_snapshots_and_existing_prefilter_decisions() {
+        // Non-default config proves the worker uses the supplied AnalystConfig.
+        let config = AnalystConfig {
+            min_liquidity_usd: 100.0,
+            max_top10_pct: 90.0,
+            max_creator_pct: 40.0,
+            max_sniper_pct: 60.0,
+        };
+        let mut markets = vec![
+            MarketSnapshot::default(), // Missing data alone is accepted.
+            MarketSnapshot {
+                liquidity_usd: Some(100.0),
+                top_10_holder_pct: Some(90.0),
+                creator_holder_pct: Some(40.0),
+                sniper_holder_pct: Some(60.0),
+                market_cap_usd: Some(0.0), // No market-cap threshold.
+                mint_authority_revoked: Some(false),
+                freeze_authority_revoked: Some(false), // Warnings only.
+                ..MarketSnapshot::default()
+            },
+            MarketSnapshot {
+                liquidity_usd: Some(99.0),
+                ..MarketSnapshot::default()
+            },
+            MarketSnapshot {
+                top_10_holder_pct: Some(91.0),
+                ..MarketSnapshot::default()
+            },
+            MarketSnapshot {
+                creator_holder_pct: Some(41.0),
+                ..MarketSnapshot::default()
+            },
+            MarketSnapshot {
+                sniper_holder_pct: Some(61.0),
+                ..MarketSnapshot::default()
+            },
+            MarketSnapshot {
+                liquidity_usd: Some(99.0),
+                top_10_holder_pct: Some(91.0),
+                creator_holder_pct: Some(41.0),
+                sniper_holder_pct: Some(61.0),
+                ..MarketSnapshot::default()
+            },
+        ];
+        let (tx, rx) = mpsc::channel(8);
+        for (index, market) in markets.iter_mut().enumerate() {
+            let candidate = candidate(index);
+            market.contract_address = candidate.contract_address.clone();
+            market.source = Some("gmgn:trenches".into());
+            tx.send(candidate).await.unwrap();
+        }
+        tx.send(candidate(7)).await.unwrap(); // No GMGN match: no prefilter record.
+        drop(tx);
+        let mut returned = markets.clone();
+        returned.push(markets[0].clone()); // Duplicate provider row.
+        returned.push(MarketSnapshot {
+            contract_address: "unrelated-mint".into(),
+            ..MarketSnapshot::default()
+        });
+        let file = path();
+        run_batches(
+            SnapshotProvider(returned),
+            rx,
+            JsonlStore::new(&file),
+            config.clone(),
+            BATCH_WINDOW,
+        )
+        .await
+        .unwrap();
+        let history = tokio::fs::read_to_string(&file).await.unwrap();
+        tokio::fs::remove_file(&file).await.unwrap();
+        let records: Vec<serde_json::Value> = history
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        assert_eq!(records.len(), 7);
+        for (index, (record, market)) in records.iter().zip(&markets).enumerate() {
+            assert_eq!(record["market"], serde_json::to_value(market).unwrap());
+            assert_eq!(
+                record["prefilter"],
+                serde_json::to_value(prefilter(market, &config)).unwrap()
+            );
+            assert_eq!(
+                record["status"],
+                if index < 2 { "ACCEPTED" } else { "REJECTED" }
+            );
+            assert_eq!(record["prefilter"]["rejected"], index >= 2);
+            assert_eq!(
+                record["prefilter"]["reasons"].as_array().unwrap().len(),
+                if index < 2 {
+                    0
+                } else if index == 6 {
+                    4
+                } else {
+                    1
+                }
+            );
+            assert!(record.get("ai").is_none());
+            assert!(record.get("social").is_none());
+        }
+        assert_eq!(
+            records[0]["prefilter"]["warnings"]
+                .as_array()
+                .unwrap()
+                .len(),
+            2
+        );
+        assert_eq!(
+            records[1]["prefilter"]["warnings"]
+                .as_array()
+                .unwrap()
+                .len(),
+            2
+        );
+    }
+
     #[tokio::test]
     async fn one_hundred_candidates_use_two_calls_without_fallback_for_misses() {
         let (tx, rx) = mpsc::channel(100);
@@ -167,9 +325,15 @@ mod tests {
             omit_last: true,
         };
         let file = path();
-        run_batches(provider, rx, JsonlStore::new(&file), BATCH_WINDOW)
-            .await
-            .unwrap();
+        run_batches(
+            provider,
+            rx,
+            JsonlStore::new(&file),
+            AnalystConfig::default(),
+            BATCH_WINDOW,
+        )
+        .await
+        .unwrap();
         assert_eq!(*calls.lock().unwrap(), vec![80, 20]);
         let history = tokio::fs::read_to_string(&file).await.unwrap();
         tokio::fs::remove_file(&file).await.unwrap();
@@ -194,9 +358,15 @@ mod tests {
             omit_last: false,
         };
         let file = path();
-        run_batches(provider, rx, JsonlStore::new(&file), BATCH_WINDOW)
-            .await
-            .unwrap();
+        run_batches(
+            provider,
+            rx,
+            JsonlStore::new(&file),
+            AnalystConfig::default(),
+            BATCH_WINDOW,
+        )
+        .await
+        .unwrap();
         assert_eq!(*calls.lock().unwrap(), vec![80, 1]);
         let history = tokio::fs::read_to_string(&file).await.unwrap();
         tokio::fs::remove_file(&file).await.unwrap();
@@ -216,6 +386,7 @@ mod tests {
             provider,
             rx,
             JsonlStore::new(path()),
+            AnalystConfig::default(),
             Duration::from_millis(30),
         ));
         tokio::time::sleep(Duration::from_millis(50)).await;
@@ -248,6 +419,7 @@ mod tests {
                 provider,
                 rx,
                 JsonlStore::new(std::env::temp_dir()),
+                AnalystConfig::default(),
                 BATCH_WINDOW
             )
             .await

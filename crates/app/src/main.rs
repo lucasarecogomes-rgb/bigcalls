@@ -76,7 +76,7 @@ async fn main() -> anyhow::Result<()> {
         .route("/health", get(health))
         .route("/webhooks/social/j7", post(ingest_social))
         .route("/analyze", post(analyze))
-        .with_state(state);
+        .with_state(state.clone());
 
     let listener = tokio::net::TcpListener::bind(bind_addr).await?;
     let market_provider = if discovery_enabled {
@@ -95,9 +95,10 @@ async fn main() -> anyhow::Result<()> {
     };
     let (market_sink, market_task) = market_provider.map(|provider| {
         let (tx, rx) = tokio::sync::mpsc::channel(256);
+        let config = state.config.clone();
         let task = tokio::spawn(async move {
             info!("GMGN read-only market enrichment enabled");
-            if let Err(error) = market::run(provider, rx, JsonlStore::new("data/market-snapshots.jsonl")).await {
+            if let Err(error) = market::run(provider, rx, JsonlStore::new("data/market-snapshots.jsonl"), config).await {
                 warn!(error = %error, "market enrichment stopped; discovery and HTTP remain available");
             }
         });

@@ -113,7 +113,7 @@ documented 80 as a guaranteed number of results.
 
 ### Batching and coverage
 
-`Pump.fun -> persist TokenCandidate -> buffer (up to 80 / 5 seconds) -> one Trenches request -> exact mint join -> MarketSnapshot`
+`Pump.fun -> persist TokenCandidate -> buffer (up to 80 / 5 seconds) -> one Trenches request -> exact mint join -> MarketSnapshot -> existing prefilter`
 
 The buffer flushes when full or five seconds after its first candidate. It makes
 no requests while empty. The existing 256-entry input queue stays nonblocking:
@@ -161,8 +161,42 @@ holdings are not overall sniper holdings.
 ratios. No new fields are created for scores or unrelated risk/social metrics.
 
 Missing, malformed, negative/non-finite numbers and invalid ratios stay `None`;
-zero is preserved. Ratios must be 0–1 before conversion to percent. No LLM or
-analysis prefilter is invoked. Snapshot source is `gmgn:trenches`.
+zero is preserved. Ratios must be 0–1 before conversion to percent. The provider
+only normalizes data; the worker then runs the existing prefilter. No LLM is
+invoked. Snapshot source is `gmgn:trenches`.
+
+### Prefilter after market enrichment
+
+Only matched, deduplicated provider snapshots run through `analyst_core::prefilter`,
+using the same `AnalystConfig` loaded for the HTTP application. No rules or
+thresholds are added. The existing hard rejects are:
+
+| Available metric | Reject condition | Existing default / environment variable |
+| --- | --- | --- |
+| Liquidity | Below minimum | $5,000 / `MIN_LIQUIDITY_USD` |
+| Top 10 holdings | Above maximum | 80% / `MAX_TOP10_HOLDERS_PCT` |
+| Creator holdings | Above maximum | 35% / `MAX_CREATOR_HOLDER_PCT` |
+| Sniper holdings | Above maximum | 50% / `MAX_SNIPER_PCT` |
+
+Equality with a limit is accepted. Missing metrics never cause rejection:
+missing liquidity/top-10 data produces warnings, and missing creator/sniper data
+does not trigger a rule. Trenches currently leaves overall sniper holdings absent.
+Active mint/freeze authorities produce warnings only. Market cap, volume, age,
+holders and bundled holdings have no hard-reject rule.
+
+Each new line in `data/market-snapshots.jsonl` preserves the original normalized
+`market`, `discoveredAt` and `fetchedAt`, and adds:
+
+- `status`: `ACCEPTED` when `prefilter.rejected` is false, otherwise `REJECTED`.
+- `prefilter`: the unchanged result containing `rejected`, `reasons` and `warnings`.
+
+`ACCEPTED` means no configured hard reject was found, even with incomplete data;
+it is eligibility for future work, not an analyst verdict or a safety guarantee.
+`REJECTED` records retain all rejection reasons and stop at the worker's gate.
+No social, J7, narrative, on-chain or AI stage is started for either status.
+Future consumers must process only explicitly `ACCEPTED` records. Older history
+lines without a status remain unevaluated; they are not implicitly accepted or
+rewritten. Unmatched candidates remain only in discovery history.
 
 ### Failure handling and verification
 
