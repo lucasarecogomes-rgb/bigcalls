@@ -19,7 +19,7 @@ It does not manage wallets, execute trades, manage positions, provide subscripti
 ## Current components
 
 - `crates/app`: local HTTP runtime.
-- `crates/analyst-core`: normalized inputs, basic prefilter, AI reasoning and local JSONL history.
+- `crates/analyst-core`: token discovery interfaces/adapters, normalized inputs, basic prefilter, AI reasoning and local JSONL history.
 - `j7-bridge`: local browser collector for J7Tracker social events.
 
 ## API
@@ -32,9 +32,45 @@ Returns the local service status.
 
 Receives a J7 social event. The event is preserved as social evidence. A social event by itself is not treated as sufficient evidence for a token decision; it must later be correlated with market/on-chain context.
 
-`POST /analyze/market`
+`POST /analyze`
 
-Receives a normalized market snapshot and runs the obvious-trash prefilter before optional LLM interpretation.
+Receives `{"market": { ... }, "social": []}` and runs the obvious-trash prefilter before optional LLM interpretation. `market` is required; `social` defaults to an empty list.
+
+## Pump.fun discovery
+
+Set `PUMPFUN_DISCOVERY_ENABLED=true` in `.env` and run `cargo run -p app`.
+Discovery is disabled by default so the existing local API can still run independently.
+
+The runtime starts one background `TokenSource`, implemented by `PumpFunSource` in
+`crates/analyst-core/src/discovery/pumpfun.rs`. The adapter subscribes to
+`subscribeNewToken` at `wss://pumpportal.fun/api/data`, using
+[PumpPortal's creation feed](https://pumpportal.fun/data-api/real-time/).
+PumpPortal is a third-party provider. Creation subscriptions are documented as free;
+the endpoint was also verified without an API key. Only events with `txType: "create"`
+and `pool: "pump"` are accepted because the feed also carries other launchpads.
+
+The flow is:
+
+`PumpPortal creation event -> PumpFunSource -> TokenCandidate -> data/token-candidates.jsonl`
+
+Each JSONL record contains `contractAddress`, `discoveredAt` (local UTC receipt time),
+`source: "pump.fun"`, `provider: "pumpportal"`, and optional `name`, `symbol`,
+`metadataUri`, `transactionSignature`, `transactionUser` and `bondingCurveAddress`.
+Missing metadata remains `null`. The transaction user is not assumed to be the creator.
+Metadata URIs are recorded without fetching them. Discovery does not infer creation time
+or market metrics, call the LLM, run the analysis prefilter, score/rank tokens, or execute trades.
+
+The runtime suppresses duplicate source/mint pairs within the last 10,000 persisted
+candidates in this process. This bounded cache survives reconnects, but not restarts;
+the history remains append-only. Source failures retry with delays from 1 to 60 seconds
+and resubscribe on a single connection. Connection attempts time out after 15 seconds;
+an idle stream is reopened after 90 seconds. Storage errors stop discovery and are logged,
+while the HTTP API stays available.
+
+This is a live feed, without backfill: events during downtime can be missed, and
+[PumpPortal reports events at processed commitment](https://pumpportal.fun/FAQ/).
+Candidates are observations for future market/on-chain enrichment, not confirmed
+analysis decisions. `/analyze` and the J7 ingestion flow retain their existing contracts.
 
 ## Market snapshot
 
@@ -121,12 +157,11 @@ The optional relay remains in `j7-bridge/bridge-server`.
 
 ## Next implementation priorities
 
-1. new-token discovery on Solana;
-2. market/liquidity/volume collector;
-3. holder/concentration/basic rug collector;
-4. correlation of token + social events;
-5. narrative discovery and influence analysis;
-6. LLM context assembly;
-7. local historical memory and reevaluation of observed tokens.
+1. market/liquidity/volume collector to enrich discovered candidates;
+2. holder/concentration/basic rug collector;
+3. correlation of token + social events;
+4. narrative discovery and influence analysis;
+5. LLM context assembly;
+6. local historical memory and reevaluation of observed tokens.
 
 This repository is intentionally a small base for those steps, not a finished trading bot.

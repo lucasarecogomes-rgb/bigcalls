@@ -126,3 +126,14 @@ Before changing architecture:
 10. run relevant checks/tests before considering a change complete.
 
 When requirements are ambiguous, favor the existing BIGCALLS architecture and avoid speculative feature expansion.
+
+User workflow preference: always commit completed project changes after the relevant checks pass. Do not commit changes with compilation errors. Include only files belonging to the completed task.
+
+## Implemented discovery layer
+
+- `analyst-core::discovery::TokenSource` yields normalized `TokenCandidate` records, separate from `MarketSnapshot` and analysis requests.
+- `PumpFunSource` uses the third-party PumpPortal live creation feed, accepting only `txType=create` and `pool=pump` events. Keep provider transport and event fields inside that adapter.
+- `PUMPFUN_DISCOVERY_ENABLED=true` enables one background collector in `crates/app`; it appends to `data/token-candidates.jsonl` using the existing JSONL store. Discovery is disabled by default.
+- Candidates preserve local discovery time and available identity/metadata; do not infer creation time, market metrics or creator identity from the transaction user.
+- This stage does not call the LLM, invoke analysis filters, rank candidates or trade. Market enrichment and social correlation remain later steps.
+- Recent duplicate suppression is bounded and in memory. Reconnects resubscribe but do not backfill missing events; provider failures must not take down the HTTP API.

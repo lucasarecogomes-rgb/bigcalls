@@ -1,9 +1,13 @@
+mod discovery;
+
 use std::{env, net::SocketAddr, sync::Arc};
 
+use analyst_core::discovery::pumpfun::PumpFunSource;
 use analyst_core::{
     prefilter, record_id, AiAnalyst, AnalysisRecord, AnalysisRequest, AnalystConfig, JsonlStore,
     SocialEvent, SocialIngestRecord,
 };
+use anyhow::Context;
 use axum::{
     extract::State,
     http::StatusCode,
@@ -37,6 +41,11 @@ async fn main() -> anyhow::Result<()> {
     dotenvy::dotenv().ok();
     init_logging();
 
+    let discovery_enabled = env::var("PUMPFUN_DISCOVERY_ENABLED")
+        .unwrap_or_else(|_| "false".into())
+        .parse::<bool>()
+        .context("PUMPFUN_DISCOVERY_ENABLED must be true or false")?;
+
     let bind_addr: SocketAddr = env::var("APP_BIND_ADDR")
         .unwrap_or_else(|_| "127.0.0.1:8790".into())
         .parse()?;
@@ -56,8 +65,7 @@ async fn main() -> anyhow::Result<()> {
                 .unwrap_or_else(|_| "data/analysis-history.jsonl".into()),
         ),
         social_store: JsonlStore::new(
-            env::var("SOCIAL_HISTORY_PATH")
-                .unwrap_or_else(|_| "data/social-history.jsonl".into()),
+            env::var("SOCIAL_HISTORY_PATH").unwrap_or_else(|_| "data/social-history.jsonl".into()),
         ),
         config: AnalystConfig::from_env(),
     });
@@ -69,8 +77,25 @@ async fn main() -> anyhow::Result<()> {
         .with_state(state);
 
     let listener = tokio::net::TcpListener::bind(bind_addr).await?;
+    let discovery_task = discovery_enabled.then(|| {
+        tokio::spawn(async {
+            info!("Pump.fun discovery enabled via PumpPortal");
+            if let Err(error) = discovery::run(
+                PumpFunSource::new(),
+                JsonlStore::new("data/token-candidates.jsonl"),
+            )
+            .await
+            {
+                warn!(error = ?error, "discovery stopped; HTTP service remains available");
+            }
+        })
+    });
     info!(%bind_addr, "BIGCALLS iniciado em modo de analise local");
-    axum::serve(listener, app).await?;
+    let result = axum::serve(listener, app).await;
+    if let Some(task) = discovery_task {
+        task.abort();
+    }
+    result?;
     Ok(())
 }
 
@@ -107,17 +132,16 @@ async fn analyze(
     Json(request): Json<AnalysisRequest>,
 ) -> Result<Json<AnalysisRecord>, ApiError> {
     if request.market.contract_address.trim().is_empty() {
-        return Err(ApiError::bad_request("market.contractAddress e obrigatorio"));
+        return Err(ApiError::bad_request(
+            "market.contractAddress e obrigatorio",
+        ));
     }
 
     let pre = prefilter(&request.market, &state.config);
     let ai = if pre.rejected {
         None
     } else if let Some(client) = &state.ai {
-        match client
-            .analyze(&request.market, &request.social, &pre)
-            .await
-        {
+        match client.analyze(&request.market, &request.social, &pre).await {
             Ok(decision) => Some(decision),
             Err(error) => {
                 warn!(error = ?error, "analise IA falhou; entrada sera preservada no historico");

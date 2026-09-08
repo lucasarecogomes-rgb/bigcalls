@@ -1,3 +1,5 @@
+pub mod discovery;
+
 use std::{
     env,
     path::{Path, PathBuf},
