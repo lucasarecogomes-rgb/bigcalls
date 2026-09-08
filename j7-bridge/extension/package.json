@@ -1,0 +1,14 @@
+{
+  "name": "bigcalls-j7-bridge",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "build": "esbuild src/content.ts --bundle --format=iife --target=chrome114 --outfile=dist/content.js",
+    "check": "tsc --noEmit"
+  },
+  "devDependencies": {
+    "esbuild": "^0.25.0",
+    "typescript": "^5.8.0"
+  }
+}

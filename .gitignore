@@ -1,0 +1,11 @@
+/target/
+/.env
+/.env.*
+!/.env.example
+/data/
+node_modules/
+j7-bridge/extension/dist/
+*.log
+*.tmp
+.DS_Store
+Thumbs.db
