@@ -137,3 +137,11 @@ User workflow preference: always commit completed project changes after the rele
 - Candidates preserve local discovery time and available identity/metadata; do not infer creation time, market metrics or creator identity from the transaction user.
 - This stage does not call the LLM, invoke analysis filters, rank candidates or trade. Market enrichment and social correlation remain later steps.
 - Recent duplicate suppression is bounded and in memory. Reconnects resubscribe but do not backfill missing events; provider failures must not take down the HTTP API.
+
+## Implemented market enrichment
+
+- Keep `TokenSource` separate from `MarketDataProvider`. `analyst-core::market` maps candidates to `MarketSnapshot`; optional `priceUsd` is the only analysis-type addition.
+- The first adapter uses the official GMGN `GET https://openapi.gmgn.ai/v1/token/info` with `X-APIKEY`, Unix-second `timestamp`, and a fresh UUID `client_id`. Only `GMGN_API_KEY` is configurable; no private key or trading endpoint is used. See README for the verified official references and field mapping.
+- When discovery and credentials are available, one market worker consumes persisted, deduplicated candidates through a bounded nonblocking queue. Successful snapshots append to `data/market-snapshots.jsonl`, with local fetch time. Missing data stays `None`; market cap is derived only from returned price and circulating supply.
+- Rate limits/timeouts/provider errors must not stop discovery or HTTP. Do not send repeated requests during cooldown. Authentication failure stops market requests; candidates remain preserved. No automatic per-token retries, ranking, thresholds, social processing or AI calls are part of this stage.
+- Preserve the fixed PumpPortal address and the current storage/retention strategy of `data/token-candidates.jsonl`; evaluate any changes to those separately later.

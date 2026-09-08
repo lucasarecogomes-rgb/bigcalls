@@ -3,13 +3,21 @@ use std::{
     time::Duration,
 };
 
-use analyst_core::{discovery::TokenSource, JsonlStore};
+use analyst_core::{
+    discovery::{TokenCandidate, TokenSource},
+    JsonlStore,
+};
 use anyhow::{Context, Result};
+use tokio::sync::mpsc::{error::TrySendError, Sender};
 use tracing::warn;
 
 const RECENT_CANDIDATE_LIMIT: usize = 10_000;
 
-pub async fn run(mut source: impl TokenSource, store: JsonlStore) -> Result<()> {
+pub async fn run(
+    mut source: impl TokenSource,
+    store: JsonlStore,
+    mut market_sink: Option<Sender<TokenCandidate>>,
+) -> Result<()> {
     let mut recent = RecentCandidates::default();
     let mut retry_delay = Duration::from_secs(1);
 
@@ -39,6 +47,19 @@ pub async fn run(mut source: impl TokenSource, store: JsonlStore) -> Result<()> 
             .await
             .context("failed to persist discovered token")?;
         recent.remember(key);
+        // Enrichment must never stall discovery or change candidate persistence.
+        if let Some(sink) = &market_sink {
+            match sink.try_send(candidate) {
+                Ok(()) => {}
+                Err(TrySendError::Full(_)) => {
+                    warn!("market queue full; candidate preserved without enrichment")
+                }
+                Err(TrySendError::Closed(_)) => {
+                    warn!("market worker unavailable; continuing discovery without enrichment");
+                    market_sink = None;
+                }
+            }
+        }
     }
 }
 
@@ -124,12 +145,17 @@ mod tests {
             drained: Some(drained_tx),
         };
         let path = history_path();
-        let task = tokio::spawn(run(source, JsonlStore::new(&path)));
+        let (market_tx, mut market_rx) = tokio::sync::mpsc::channel(2);
+        let task = tokio::spawn(run(source, JsonlStore::new(&path), Some(market_tx)));
 
         let drained = tokio::time::timeout(Duration::from_secs(5), drained_rx).await;
         task.abort();
         let _ = task.await;
         drained.unwrap().unwrap();
+
+        assert_eq!(market_rx.try_recv().unwrap().source, first.source);
+        assert_eq!(market_rx.try_recv().unwrap().source, another_source.source);
+        assert!(market_rx.try_recv().is_err());
 
         let history = tokio::fs::read_to_string(&path).await.unwrap();
         tokio::fs::remove_file(&path).await.unwrap();
@@ -147,13 +173,37 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn full_market_queue_does_not_block_or_change_candidate_history() {
+        let first = candidate();
+        let mut second = first.clone();
+        second.contract_address = "another-mint".into();
+        let (drained_tx, drained_rx) = oneshot::channel();
+        let source = MockSource {
+            candidates: VecDeque::from([first, second]),
+            drained: Some(drained_tx),
+        };
+        let path = history_path();
+        let (market_tx, mut market_rx) = tokio::sync::mpsc::channel(1);
+        let task = tokio::spawn(run(source, JsonlStore::new(&path), Some(market_tx)));
+        let drained = tokio::time::timeout(Duration::from_secs(5), drained_rx).await;
+        task.abort();
+        let _ = task.await;
+        drained.unwrap().unwrap();
+        assert!(market_rx.try_recv().is_ok());
+        assert!(market_rx.try_recv().is_err());
+        let history = tokio::fs::read_to_string(&path).await.unwrap();
+        tokio::fs::remove_file(&path).await.unwrap();
+        assert_eq!(history.lines().count(), 2);
+    }
+
+    #[tokio::test]
     async fn storage_failure_stops_discovery() {
         let source = MockSource {
             candidates: VecDeque::from([candidate()]),
             drained: None,
         };
         // A directory cannot be opened as the JSONL history file.
-        let result = run(source, JsonlStore::new(std::env::temp_dir())).await;
+        let result = run(source, JsonlStore::new(std::env::temp_dir()), None).await;
         assert!(result
             .unwrap_err()
             .to_string()

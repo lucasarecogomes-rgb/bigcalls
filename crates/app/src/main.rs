@@ -1,8 +1,10 @@
 mod discovery;
+mod market;
 
 use std::{env, net::SocketAddr, sync::Arc};
 
 use analyst_core::discovery::pumpfun::PumpFunSource;
+use analyst_core::market::gmgn::GmgnMarketDataProvider;
 use analyst_core::{
     prefilter, record_id, AiAnalyst, AnalysisRecord, AnalysisRequest, AnalystConfig, JsonlStore,
     SocialEvent, SocialIngestRecord,
@@ -77,12 +79,37 @@ async fn main() -> anyhow::Result<()> {
         .with_state(state);
 
     let listener = tokio::net::TcpListener::bind(bind_addr).await?;
+    let market_provider = if discovery_enabled {
+        env::var("GMGN_API_KEY")
+            .ok()
+            .filter(|key| !key.trim().is_empty())
+            .and_then(|key| match GmgnMarketDataProvider::new(key) {
+                Ok(provider) => Some(provider),
+                Err(error) => {
+                    warn!(error = %error, "market provider disabled; discovery remains available");
+                    None
+                }
+            })
+    } else {
+        None
+    };
+    let (market_sink, market_task) = market_provider.map(|provider| {
+        let (tx, rx) = tokio::sync::mpsc::channel(256);
+        let task = tokio::spawn(async move {
+            info!("GMGN read-only market enrichment enabled");
+            if let Err(error) = market::run(provider, rx, JsonlStore::new("data/market-snapshots.jsonl")).await {
+                warn!(error = %error, "market enrichment stopped; discovery and HTTP remain available");
+            }
+        });
+        (tx, task)
+    }).unzip();
     let discovery_task = discovery_enabled.then(|| {
-        tokio::spawn(async {
+        tokio::spawn(async move {
             info!("Pump.fun discovery enabled via PumpPortal");
             if let Err(error) = discovery::run(
                 PumpFunSource::new(),
                 JsonlStore::new("data/token-candidates.jsonl"),
+                market_sink,
             )
             .await
             {
@@ -93,6 +120,9 @@ async fn main() -> anyhow::Result<()> {
     info!(%bind_addr, "BIGCALLS iniciado em modo de analise local");
     let result = axum::serve(listener, app).await;
     if let Some(task) = discovery_task {
+        task.abort();
+    }
+    if let Some(task) = market_task {
         task.abort();
     }
     result?;

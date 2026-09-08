@@ -1,4 +1,5 @@
 pub mod discovery;
+pub mod market;
 
 use std::{
     env,
@@ -44,6 +45,8 @@ pub struct MarketSnapshot {
     pub contract_address: String,
     pub symbol: Option<String>,
     pub name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub price_usd: Option<f64>,
     pub market_cap_usd: Option<f64>,
     pub liquidity_usd: Option<f64>,
     pub volume_5m_usd: Option<f64>,
