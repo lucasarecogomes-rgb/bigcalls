@@ -1,4 +1,5 @@
 //! Local exact-contract correlation. JSONL remains the source of truth.
+use crate::history::Tail;
 use analyst_core::{JsonlStore, SocialIngestRecord};
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
@@ -8,52 +9,7 @@ use std::{
     path::PathBuf,
     sync::Arc,
 };
-use tokio::{
-    fs::File,
-    io::{AsyncBufReadExt, AsyncSeekExt, BufReader, SeekFrom},
-    sync::Notify,
-};
-use tracing::warn;
-
-struct Tail {
-    path: PathBuf,
-    offset: u64,
-}
-
-impl Tail {
-    fn new(path: PathBuf) -> Self {
-        Self { path, offset: 0 }
-    }
-
-    async fn read_new(&mut self) -> Result<Vec<(u64, Value)>> {
-        let file = match File::open(&self.path).await {
-            Ok(file) => file,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(vec![]),
-            Err(error) => return Err(error.into()),
-        };
-        anyhow::ensure!(
-            file.metadata().await?.len() >= self.offset,
-            "correlation history was truncated"
-        );
-        let mut reader = BufReader::new(file);
-        reader.seek(SeekFrom::Start(self.offset)).await?;
-        let mut records = Vec::new();
-        loop {
-            let mut line = Vec::new();
-            let size = reader.read_until(b'\n', &mut line).await?;
-            if size == 0 || line.last() != Some(&b'\n') {
-                break;
-            }
-            let offset = self.offset;
-            self.offset += size as u64;
-            match serde_json::from_slice(&line) {
-                Ok(value) => records.push((offset, value)),
-                Err(_) => warn!(offset, "invalid correlation history line skipped"),
-            }
-        }
-        Ok(records)
-    }
-}
+use tokio::sync::Notify;
 
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -187,8 +143,10 @@ pub(crate) async fn run(
     social: PathBuf,
     output: PathBuf,
     notify: Arc<Notify>,
+    output_notify: Arc<Notify>,
 ) -> Result<()> {
     let mut correlator = Correlator::open(markets, social, output).await?;
+    correlator.output = correlator.output.with_notify(output_notify);
     loop {
         correlator.reconcile().await?;
         // Notifications coalesce; unread durable lines do not get dropped.

@@ -9,10 +9,12 @@ BIGCALLS is the base for the MVP we defined:
 1. receive/discover new Solana tokens;
 2. collect and normalize basic market/on-chain metrics;
 3. reject only obvious trash/rug conditions;
-4. correlate social activity and narratives;
-5. let the LLM interpret context instead of replacing analysis with fixed scores;
-6. classify opportunities as `IGNORE`, `OBSERVE` or `RESEARCH`;
-7. preserve local analysis history for future memory/context.
+4. correlate existing J7 events by contract for accepted market observations;
+5. assemble typed market/prefilter/on-chain/social evidence in local history;
+6. later, explicitly invoke AI interpretation; automatic discovery never calls the LLM.
+
+The implemented automatic pipeline stops at `data/analysis-contexts.jsonl`.
+The existing manual `/analyze` endpoint remains separate and unchanged.
 
 It does not manage wallets, execute trades, manage positions, provide subscriptions, admin panels, Telegram UI or multi-user product features.
 
@@ -244,8 +246,8 @@ Context revisions append to **`data/social-contexts.jsonl`**. Each contains:
 
 Use the last context for a `(marketHistoryPath, marketHistoryOffset,
 socialHistoryPath)` key. The reference recovers the original market/prefilter;
-contract and market fetch time also allow future association with on-chain
-observations. This task does not assemble or send an AI request.
+contract and market fetch time allow association with on-chain observations.
+The analysis-context worker below assembles this evidence without sending an AI request.
 
 MVP limits: append-only files must retain their paths/order; rotation, truncation
 and external writers are not supported live. External additions are picked up on
@@ -285,8 +287,8 @@ Absent/unparsed/non-mint accounts leave the new fields `None`; omitted extension
 lists remain `None`, and an explicitly empty list remains empty. Reported names
 do not establish complete extension coverage or whether a capability is active.
 
-Results append to `data/onchain-snapshots.jsonl` with `marketRecordId` (the existing
-`record_id` hash of the input record), `marketFetchedAt`, `observedAt` and `onChain`.
+Results append to `data/onchain-snapshots.jsonl` with `marketRecordId` (an opaque ID
+from the clock-dependent `record_id`), `marketFetchedAt`, `observedAt` and `onChain`.
 Market and candidate histories are unchanged. Existing historical records are
 not replayed automatically. Queue overflow, closed worker or RPC failure leaves
 the accepted market record available for future reevaluation; no synthetic
@@ -412,12 +414,99 @@ Load the extension as unpacked in Chrome/Edge and keep J7Tracker open. The exten
 
 The optional relay remains in `j7-bridge/bridge-server`.
 
+## Assembled analysis context (no automatic AI)
+
+`analyst_core::context::AnalysisContext` is an explicit serializable/deserializable
+Rust type. An independent local worker reads the three evidence histories and
+appends to `data/analysis-contexts.jsonl`. No new API request or prefilter execution
+occurs. Only explicit `ACCEPTED` with `prefilter.rejected == false` is eligible.
+
+The serialized shape is:
+
+```text
+AnalysisContext {
+  token: { contractAddress: string, name: string|null, symbol: string|null },
+  market: MarketSnapshot,
+  prefilter: { rejected: boolean, reasons: string[], warnings: string[] },
+  onChain: OnChainSnapshot|null,
+  socialEvents: SocialIngestRecord[],
+  provenance: {
+    market: {
+      history: { path: string, offset: integer },
+      discoveredAt: timestamp, fetchedAt: timestamp, source: string|null
+    },
+    onChain: {
+      history: { path: string, offset: integer },
+      marketRecordId: string, marketFetchedAt: timestamp, observedAt: timestamp
+    }|null,
+    social: {
+      history: { path: string, offset: integer },
+      socialHistoryPath: string, matchMethod: "contractAddress"
+    }|null
+  },
+  missingData: string[]
+}
+```
+
+`MarketSnapshot` retains every existing field and original optional values; notably
+absent `priceUsd` keeps its existing omitted-field serialization. `OnChainSnapshot`
+retains `source`, `commitment`, `contractAddress`, `slot`, `tokenProgram` and
+`reportedExtensions`. Every `SocialIngestRecord` retains `id`, `receivedAt` and
+the complete existing `SocialEvent`, including individual detection times/sources.
+No provenance or collection timestamp is replaced with assembly time.
+
+Association rules:
+
+- Market history path + byte offset identifies the authoritative observation.
+  Its identity, market and prefilter are copied, never patched with another observation.
+- Existing on-chain `marketRecordId` cannot be recomputed: `record_id` incorporates
+  wall-clock time and market history does not store that ID. Preserve it as opaque
+  provenance. Join using the already persisted exact mint + `marketFetchedAt` only
+  when that pair identifies exactly one market row (including legacy/rejected rows
+  when counting ambiguity). Otherwise leave on-chain absent. Latest matching
+  on-chain append wins; no RPC retry is made to fill a gap.
+- Social uses the last valid corresponding revision in append order, matching market
+  history path/offset, mint, fetch time, configured social-history path and exact-contract
+  match method. Every individual event must also carry that mint. Unrelated or
+  inconsistent rows cannot replace a valid revision. No ticker/name matching.
+
+`missingData` is a fixed-order list of absent field paths: token name/symbol;
+market price, cap, liquidity, 5m/1h volume, holders, top-10/creator/sniper/bundled
+percentages, mint/freeze authority flags, creation time and source. If on-chain is
+absent, add `onChain`; otherwise list missing token program, reported extensions,
+slot or commitment. Empty social events add `socialEvents`. Zero, false and a
+reported empty extension list count as present. This is a coverage inventory,
+never a risk, score or change to prefilter warnings. Unsupported facts such as
+LP locking or sentiment are not invented as new fields.
+
+One additional local notification consumer is registered for market writes;
+on-chain and social-context writes also notify the assembler. Existing consumers
+remain registered. Startup replays histories, then only unread complete lines
+are loaded after notifications. No polling or scheduler. Source histories remain
+append-only and unchanged.
+
+Use the last analysis-context row for a market history path/offset. Later social
+or on-chain evidence appends a revision with new evidence references while keeping
+prior rows. Identical complete payloads are not appended again, including after
+restart; source revision offsets are part of provenance, so a genuinely new source
+revision can produce a new context even if its event text repeats.
+
+Limits: stable append-only paths/offsets, in-memory indexes and full-context
+revisions grow with history. No time window, expiration, retention policy, provider
+refresh or automatic AI invocation is added. Corrupt/unreadable evidence cannot be
+used to invent values; I/O failure stops only assembly and is logged. Restart
+rebuilds from source histories. Ambiguous historical on-chain references remain
+missing until better provenance is available.
+
 ## Next implementation priorities
 
-1. holder/concentration/basic rug collector;
-2. correlation of token + social events;
-3. narrative discovery and influence analysis;
-4. LLM context assembly;
-5. local historical memory and reevaluation of observed tokens, including market retries/refreshes.
+Market enrichment, existing prefilter, optional mint context, local J7 correlation
+and typed analysis-context assembly are implemented. None automatically invokes AI.
 
-This repository is intentionally a small base for those steps, not a finished trading bot.
+Future work, not implemented here:
+
+1. review assembled evidence and measured coverage before expanding providers;
+2. define an explicit, cost-controlled AI invocation contract using `AnalysisContext`;
+3. evaluate refresh/reassessment and history retention based on actual local usage.
+
+Narrative, sentiment and influence interpretation remain outside deterministic code.

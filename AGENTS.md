@@ -59,7 +59,9 @@ Never invent missing market, on-chain or social facts.
 
 Keep the system conceptually close to:
 
-`token discovery -> market context -> basic risk/on-chain context -> social/narrative context -> AI analysis -> local history/memory`
+`token discovery -> market context -> existing prefilter -> ACCEPTED -> optional on-chain + local J7 correlation -> typed AnalysisContext -> local history`
+
+This automatic pipeline is implemented through context persistence. AI interpretation is future work; the separate manual `/analyze` endpoint keeps its current behavior. Do not treat context assembly, holder collection or token/social correlation as unimplemented priorities.
 
 Market context should be available before the AI makes a token decision. Social events alone are evidence, not a sufficient token decision trigger.
 
@@ -78,7 +80,7 @@ Useful conceptual interfaces:
 Current direction:
 - Pump.fun can be used as an initial token-discovery universe instead of scanning the entire Solana chain.
 - Prefer structured data/APIs over making the AI visually operate dashboards.
-- GMGN can be evaluated as a structured market/on-chain data source, but must not become a hard architectural dependency.
+- GMGN supplies current batched market enrichment behind `MarketDataProvider`; optional Solana RPC supplies mint context behind `OnChainProvider`.
 - J7 is an initial social/narrative source, not the primary token-discovery mechanism.
 
 Do not call the LLM for every raw chain or J7 event. Assemble useful context first.
@@ -159,12 +161,20 @@ User workflow preference: always commit completed project changes after the rele
 
 - `OnChainProvider` isolates optional Solana RPC collection. `SOLANA_RPC_URL` enables a separate bounded worker; preserve GMGN's existing batches and send only their accepted subset after market persistence. Verify `ACCEPTED` and `!prefilter.rejected` again before provider calls. No new risk decisions or rules.
 - One `getMultipleAccounts` request with `jsonParsed` / `confirmed` collects only recognized mint program owner and reported extension names, plus slot/source provenance. Do not duplicate GMGN holder/authority metrics or infer extension state, fees, LP safety, sniper/bundle percentages. Missing/unparsed data stays `None`.
-- Append to `data/onchain-snapshots.jsonl`, referencing the original market record by `record_id` hash and fetch time. No rewrites or automatic historical replay. Errors/full queue preserve accepted market history, with no per-token retries or blocking of discovery, GMGN or HTTP. Keep RPC URLs/credentials out of logs.
+- Append to `data/onchain-snapshots.jsonl` with opaque clock-dependent `marketRecordId`, exact mint and market fetch time. That ID cannot be recomputed from market history. No rewrites or automatic provider replay. Errors/full queue preserve accepted market history, with no per-token retries or blocking of discovery, GMGN or HTTP. Keep RPC URLs/credentials out of logs.
 
 ## Implemented accepted-only social correlation
 
 - A separate local worker indexes existing market and J7 JSONL histories by exact case-sensitive contract (outer whitespace trimmed). Only explicit `ACCEPTED` with `prefilter.rejected == false` authorizes context. No ticker/name-only matches, new rules, scores, X requests or AI calls.
 - On startup, replay social and market histories; then use opt-in `JsonlStore` notifications after complete writes and incremental byte offsets. Notifications coalesce without losing durable inputs. No polling, scheduler, collector change or storage migration.
 - Append full context revisions to `data/social-contexts.jsonl`, keyed by the accepted market history path/byte offset and social history path. Preserve each complete `SocialIngestRecord` for provenance. No events is `socialEvents: []`; repeated receipts remain separate. Replaying unchanged inputs must not append identical latest contexts.
-- Social correlation is independent of optional on-chain success. Source histories and existing on-chain behavior remain unchanged. Future AI assembly can use the accepted history reference plus contract/fetch time; do not automatically invoke it.
+- Social correlation is independent of optional on-chain success. Source histories and existing on-chain behavior remain unchanged. Typed context assembly uses the accepted history reference plus contract/fetch time; do not automatically invoke AI.
 - This MVP assumes append-only stable history files, keeps an in-memory index and uses no time window or retention changes. I/O failure stops only this worker; restart rebuilds from the source histories.
+
+## Implemented typed analysis context
+
+- `analyst_core::context::AnalysisContext` explicitly carries token identity, the authoritative market observation, unchanged prefilter, optional on-chain snapshot, full social receipts, typed provenance and deterministic `missingData` field paths. No new metrics, decisions, provider calls or AI invocation.
+- The assembler accepts only `ACCEPTED` and `!prefilter.rejected`. Market history path/byte offset identifies a context. On-chain uses exact mint + market fetch time only when unique across market history; keep opaque `marketRecordId`, never recompute it. Social uses the latest valid matching history revision, verifying original market reference, mint, fetch time and every event mint.
+- `data/analysis-contexts.jsonl` contains append-only full revisions. Preserve collection timestamps/source information, missing options and empty social arrays. Missing data is not a risk and never changes prefilter warnings. Do not add a volatile assembly timestamp that defeats identical-context suppression.
+- Reuse the incremental JSONL reader and local notifications; market writes wake both independent consumers, on-chain/social-context writes wake assembly. Restart rebuilds and suppresses identical latest contexts. Preserve all upstream behavior and the manual `/analyze` endpoint.
+- Current next priorities are evaluating evidence coverage, specifying explicit cost-controlled AI invocation, and measuring refresh/retention needs. Narrative, sentiment and influence interpretation are not deterministic assembly work.

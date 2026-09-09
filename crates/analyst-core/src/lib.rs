@@ -1,3 +1,4 @@
+pub mod context;
 pub mod discovery;
 pub mod market;
 pub mod onchain;
@@ -115,7 +116,7 @@ pub struct SocialIngestRecord {
     pub event: SocialEvent,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PrefilterResult {
     pub rejected: bool,
@@ -303,7 +304,7 @@ fn extract_output_text(value: &serde_json::Value) -> Option<String> {
 pub struct JsonlStore {
     path: PathBuf,
     lock: Arc<Mutex<()>>,
-    notify: Option<Arc<Notify>>,
+    notify: Vec<Arc<Notify>>,
 }
 
 impl JsonlStore {
@@ -311,13 +312,13 @@ impl JsonlStore {
         Self {
             path: path.as_ref().to_path_buf(),
             lock: Arc::new(Mutex::new(())),
-            notify: None,
+            notify: Vec::new(),
         }
     }
 
     /// Wake an optional local history consumer after a complete line is visible.
     pub fn with_notify(mut self, notify: Arc<Notify>) -> Self {
-        self.notify = Some(notify);
+        self.notify.push(notify);
         self
     }
 
@@ -337,9 +338,11 @@ impl JsonlStore {
         let mut line = serde_json::to_vec(value)?;
         line.push(b'\n');
         file.write_all(&line).await?;
-        if let Some(notify) = &self.notify {
+        if !self.notify.is_empty() {
             file.flush().await?;
-            notify.notify_one();
+            for notify in &self.notify {
+                notify.notify_one();
+            }
         }
         Ok(())
     }

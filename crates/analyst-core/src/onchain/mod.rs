@@ -1,10 +1,10 @@
 //! Read-only mint context. No market duplication or risk decisions.
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::future::Future;
 
 pub mod solana;
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct OnChainSnapshot {
     pub source: String,

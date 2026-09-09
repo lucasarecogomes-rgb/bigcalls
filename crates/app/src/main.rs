@@ -1,4 +1,6 @@
+mod context;
 mod discovery;
+mod history;
 mod market;
 mod onchain;
 mod social;
@@ -63,6 +65,7 @@ async fn main() -> anyhow::Result<()> {
         });
 
     let social_notify = Arc::new(tokio::sync::Notify::new());
+    let context_notify = Arc::new(tokio::sync::Notify::new());
     let social_history_path =
         env::var("SOCIAL_HISTORY_PATH").unwrap_or_else(|_| "data/social-history.jsonl".into());
     let state = Arc::new(AppState {
@@ -82,13 +85,31 @@ async fn main() -> anyhow::Result<()> {
         .with_state(state.clone());
 
     let listener = tokio::net::TcpListener::bind(bind_addr).await?;
+    let context_wake = context_notify.clone();
+    let context_social_history = social_history_path.clone();
+    let context_task = tokio::spawn(async move {
+        if let Err(error) = context::run(
+            "data/market-snapshots.jsonl".into(),
+            "data/onchain-snapshots.jsonl".into(),
+            "data/social-contexts.jsonl".into(),
+            context_social_history.into(),
+            "data/analysis-contexts.jsonl".into(),
+            context_wake,
+        )
+        .await
+        {
+            warn!(error = %error, "analysis context assembly stopped; source histories remain preserved");
+        }
+    });
     let social_wake = social_notify.clone();
+    let social_output_wake = context_notify.clone();
     let social_task = tokio::spawn(async move {
         if let Err(error) = social::run(
             "data/market-snapshots.jsonl".into(),
             social_history_path.into(),
             "data/social-contexts.jsonl".into(),
             social_wake,
+            social_output_wake,
         )
         .await
         {
@@ -114,8 +135,9 @@ async fn main() -> anyhow::Result<()> {
             .and_then(|url| match analyst_core::onchain::solana::SolanaRpcProvider::new(&url) {
                 Ok(provider) => {
                     let (tx, rx) = tokio::sync::mpsc::channel(8);
+                    let onchain_wake = context_notify.clone();
                     let task = tokio::spawn(async move {
-                        if let Err(error) = onchain::run(provider, rx, JsonlStore::new("data/onchain-snapshots.jsonl")).await {
+                        if let Err(error) = onchain::run(provider, rx, JsonlStore::new("data/onchain-snapshots.jsonl").with_notify(onchain_wake)).await {
                             warn!(error = %error, "on-chain worker stopped; market enrichment and HTTP remain available");
                         }
                     });
@@ -131,7 +153,7 @@ async fn main() -> anyhow::Result<()> {
         let config = state.config.clone();
         let task = tokio::spawn(async move {
             info!("GMGN read-only market enrichment enabled");
-            if let Err(error) = market::run(provider, rx, JsonlStore::new("data/market-snapshots.jsonl").with_notify(social_notify), config, onchain_sink).await {
+            if let Err(error) = market::run(provider, rx, JsonlStore::new("data/market-snapshots.jsonl").with_notify(social_notify).with_notify(context_notify), config, onchain_sink).await {
                 warn!(error = %error, "market enrichment stopped; discovery and HTTP remain available");
             }
         });
@@ -163,6 +185,7 @@ async fn main() -> anyhow::Result<()> {
         task.abort();
     }
     social_task.abort();
+    context_task.abort();
     result?;
     Ok(())
 }
