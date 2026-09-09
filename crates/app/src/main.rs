@@ -1,4 +1,5 @@
 mod context;
+mod context_ai;
 mod discovery;
 mod history;
 mod market;
@@ -22,12 +23,13 @@ use axum::{
     Json, Router,
 };
 use chrono::Utc;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use tracing::{info, warn};
 
 #[derive(Clone)]
 struct AppState {
     ai: Option<AiAnalyst>,
+    context_ai: Option<Arc<context_ai::AnalysisService>>,
     analysis_store: JsonlStore,
     social_store: JsonlStore,
     config: AnalystConfig,
@@ -66,10 +68,28 @@ async fn main() -> anyhow::Result<()> {
 
     let social_notify = Arc::new(tokio::sync::Notify::new());
     let context_notify = Arc::new(tokio::sync::Notify::new());
+    let ai_notify = Arc::new(tokio::sync::Notify::new());
+    let auto_ai = context_ai::auto_enabled(env::var("AI_AUTO_ANALYSIS_ENABLED").ok().as_deref())?;
+    let context_ai = match context_ai::AnalysisService::open(
+        ai.clone(),
+        "data/analysis-contexts.jsonl".into(),
+        "data/market-snapshots.jsonl".into(),
+        "data/ai-analysis.jsonl".into(),
+        "data/ai-analysis-attempts.jsonl".into(),
+    )
+    .await
+    {
+        Ok(service) => Some(Arc::new(service)),
+        Err(error) => {
+            warn!(error = %error, "context AI disabled: cost history could not be recovered");
+            None
+        }
+    };
     let social_history_path =
         env::var("SOCIAL_HISTORY_PATH").unwrap_or_else(|_| "data/social-history.jsonl".into());
     let state = Arc::new(AppState {
         ai,
+        context_ai: context_ai.clone(),
         analysis_store: JsonlStore::new(
             env::var("ANALYSIS_HISTORY_PATH")
                 .unwrap_or_else(|_| "data/analysis-history.jsonl".into()),
@@ -82,9 +102,32 @@ async fn main() -> anyhow::Result<()> {
         .route("/health", get(health))
         .route("/webhooks/social/j7", post(ingest_social))
         .route("/analyze", post(analyze))
+        .route("/analyze-context", post(analyze_context))
         .with_state(state.clone());
 
     let listener = tokio::net::TcpListener::bind(bind_addr).await?;
+    let ai_task = if auto_ai {
+        if let Some(service) = context_ai {
+            match context_ai::new_context_tail("data/analysis-contexts.jsonl".into()).await {
+                Ok(tail) => {
+                    let notify = ai_notify.clone();
+                    Some(tokio::spawn(async move {
+                        if let Err(error) = context_ai::run(true, service, tail, notify).await {
+                            warn!(error = %error, "automatic context AI stopped; other pipeline stages continue");
+                        }
+                    }))
+                }
+                Err(error) => {
+                    warn!(error = %error, "automatic context AI disabled: cannot locate new contexts");
+                    None
+                }
+            }
+        } else {
+            None
+        }
+    } else {
+        None
+    };
     let context_wake = context_notify.clone();
     let context_social_history = social_history_path.clone();
     let context_task = tokio::spawn(async move {
@@ -95,6 +138,7 @@ async fn main() -> anyhow::Result<()> {
             context_social_history.into(),
             "data/analysis-contexts.jsonl".into(),
             context_wake,
+            ai_notify,
         )
         .await
         {
@@ -186,6 +230,9 @@ async fn main() -> anyhow::Result<()> {
     }
     social_task.abort();
     context_task.abort();
+    if let Some(task) = ai_task {
+        task.abort();
+    }
     result?;
     Ok(())
 }
@@ -216,6 +263,41 @@ async fn ingest_social(
         .map_err(ApiError::internal)?;
 
     Ok((StatusCode::ACCEPTED, Json(record)))
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct ContextAnalysisRequest {
+    context_offset: u64,
+}
+
+async fn analyze_context(
+    State(state): State<Arc<AppState>>,
+    Json(request): Json<ContextAnalysisRequest>,
+) -> Result<Json<analyst_core::context_ai::ContextAnalysisRecord>, ApiError> {
+    let service = state.context_ai.as_ref().ok_or_else(|| ApiError {
+        status: StatusCode::SERVICE_UNAVAILABLE,
+        message: "context AI unavailable; check startup logs".into(),
+    })?;
+    service
+        .analyze_offset(request.context_offset)
+        .await
+        .map(Json)
+        .map_err(|error| {
+            use context_ai::AnalysisError::*;
+            let status = match error {
+                InvalidReference => StatusCode::BAD_REQUEST,
+                Ineligible => StatusCode::UNPROCESSABLE_ENTITY,
+                AlreadyAttempted => StatusCode::CONFLICT,
+                Unavailable => StatusCode::SERVICE_UNAVAILABLE,
+                Provider => StatusCode::BAD_GATEWAY,
+                Storage => StatusCode::INTERNAL_SERVER_ERROR,
+            };
+            ApiError {
+                status,
+                message: error.to_string(),
+            }
+        })
 }
 
 async fn analyze(

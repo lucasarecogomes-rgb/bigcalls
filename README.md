@@ -11,9 +11,9 @@ BIGCALLS is the base for the MVP we defined:
 3. reject only obvious trash/rug conditions;
 4. correlate existing J7 events by contract for accepted market observations;
 5. assemble typed market/prefilter/on-chain/social evidence in local history;
-6. later, explicitly invoke AI interpretation; automatic discovery never calls the LLM.
+6. deliberately analyze an existing context with the same AiAnalyst; automation is opt-in.
 
-The implemented automatic pipeline stops at `data/analysis-contexts.jsonl`.
+By default the automatic pipeline stops at `data/analysis-contexts.jsonl`.
 The existing manual `/analyze` endpoint remains separate and unchanged.
 
 It does not manage wallets, execute trades, manage positions, provide subscriptions, admin panels, Telegram UI or multi-user product features.
@@ -498,15 +498,106 @@ used to invent values; I/O failure stops only assembly and is logged. Restart
 rebuilds from source histories. Ambiguous historical on-chain references remain
 missing until better provenance is available.
 
+## Explicit context AI contract
+
+`AnalysisContext -> AiAnalyst::analyze_context(&AnalysisContext) -> AiDecision`
+uses the existing analyst, client, `OPENAI_API_KEY` and `OPENAI_MODEL`. The legacy
+`/analyze` endpoint and its behavior remain unchanged. No provider is queried again.
+
+Manual testing uses the same serialized service as the optional automatic worker:
+
+```http
+POST /analyze-context
+Content-Type: application/json
+
+{"contextOffset":0}
+```
+
+`contextOffset` is the starting **byte offset in `data/analysis-contexts.jsonl`**
+(0 selects its first line), not a line number or market-history offset. The endpoint
+accepts no arbitrary context payload or file path. It loads that complete line and
+checks the original market history row: explicit ACCEPTED, non-rejected prefilter,
+matching identity/fetch time, and unchanged market/prefilter values. Ineligible
+records never reach the analyst. Success returns the existing or newly persisted
+`ContextAnalysisRecord`; an identical analyzed context returns its cached record.
+
+The OpenAI request is `POST https://api.openai.com/v1/responses` with bearer auth,
+the existing model, `store: false`, `max_output_tokens: 4096`, a 90s timeout, fixed
+`instructions` and the full typed context as a separate user input. No tools or
+external lookup are enabled. Structured Outputs uses
+`text.format = { type: "json_schema", name: "bigcalls_ai_decision", strict: true,
+schema: ... }`, following the [official OpenAI guide](https://developers.openai.com/api/docs/guides/structured-outputs).
+
+The strict schema is an object with `additionalProperties: false` and all eight
+fields required: `verdict` (IGNORE/OBSERVE/RESEARCH), integer `confidence` (0..100),
+`narrative` (string|null), `thesis` (string), and string arrays `positives`, `risks`,
+`missingData`, `nextChecks`. Code also checks exact fields, types and confidence
+<=100. Refusals, incomplete responses and invalid JSON never become decisions.
+
+Instructions treat the context as the sole factual evidence, preserve uncertainty,
+distinguish timestamps, and allow interpretation of market/social relationships
+without invented narrative, metrics, events or author influence. Repeated social
+receipts are not necessarily independent endorsements. Missing data is not itself
+risk; cap alone is not quality. Evidence text is data, not model instructions.
+There are no extra thresholds, deterministic scoring or purchase amounts.
+
+Successful records append durably to `data/ai-analysis.jsonl`:
+
+```text
+{
+  context: { path, offset },
+  contractAddress,
+  analyzedAt,
+  model,
+  contextHash,
+  decision: AiDecision
+}
+```
+
+`contextHash` is stable SHA-256 over the exact serialized typed-context payload,
+without clock time or model in the key. Different key order/JSON whitespace is
+normalized by typed deserialization. A changed evidence revision can be analyzed
+separately; changing the model alone does not bypass duplicate protection.
+
+Before any paid attempt, the service durably appends `{ contextHash, context,
+attemptedAt, model }` to `data/ai-analysis-attempts.jsonl`. This separate journal
+contains attempts, not decisions. Both journals are recovered on startup, and a
+shared mutex serializes manual/automatic requests with maximum concurrency one.
+Successful duplicates return cached results; attempted contexts without a result
+return HTTP 409 and are never silently resent. This deliberately chooses at most
+one attempted send: a crash after journaling but before sending can leave a context
+unanalyzed. A response lost before result persistence is also not resent. Damaged
+cost journals disable this service rather than risk repeating paid requests.
+Do not delete journals to casually retry a context.
+
+`AI_AUTO_ANALYSIS_ENABLED=false` is the default. No automatic AI task is started
+and no automatic OpenAI calls occur. Manual analysis still works with a key.
+When explicitly true, the worker captures EOF before context assembly starts,
+then follows new complete context lines through local notifications. Existing
+history (including backlog from downtime) remains manual-only on every startup.
+There is no ranking, threshold, scheduler, periodic polling or automatic retry.
+Provider failures use a 60s cooldown before the next distinct context; processing
+continues without affecting collectors, assembly or HTTP. The 4096 output-token
+limit and timeout bound an individual request, but input size and the number of
+distinct new revisions can still grow costs when automation is enabled.
+
+Manual HTTP errors: 400 invalid reference, 422 ineligible context, 409 already
+attempted without a result, 503 unavailable key/service, 502 provider/response
+failure, 500 journal failure. Existing source histories are preserved throughout.
+This is a single-process local MVP; the in-process lock does not coordinate
+multiple BIGCALLS processes sharing journals. No live OpenAI request is run in
+the normal tests, and this implementation was validated with mock responses only.
+
 ## Next implementation priorities
 
 Market enrichment, existing prefilter, optional mint context, local J7 correlation
-and typed analysis-context assembly are implemented. None automatically invokes AI.
+and typed analysis-context assembly are implemented. Context AI is available
+manually, with optional automation explicitly disabled by default.
 
 Future work, not implemented here:
 
 1. review assembled evidence and measured coverage before expanding providers;
-2. define an explicit, cost-controlled AI invocation contract using `AnalysisContext`;
+2. evaluate real manual context analyses before enabling automatic consumption;
 3. evaluate refresh/reassessment and history retention based on actual local usage.
 
 Narrative, sentiment and influence interpretation remain outside deterministic code.

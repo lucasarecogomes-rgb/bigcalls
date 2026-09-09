@@ -61,7 +61,7 @@ Keep the system conceptually close to:
 
 `token discovery -> market context -> existing prefilter -> ACCEPTED -> optional on-chain + local J7 correlation -> typed AnalysisContext -> local history`
 
-This automatic pipeline is implemented through context persistence. AI interpretation is future work; the separate manual `/analyze` endpoint keeps its current behavior. Do not treat context assembly, holder collection or token/social correlation as unimplemented priorities.
+The default automatic pipeline ends at context persistence. AI interpretation of full contexts is available deliberately through `/analyze-context`; `AI_AUTO_ANALYSIS_ENABLED=false` keeps automatic paid calls disabled. The separate legacy `/analyze` endpoint keeps its behavior. Do not treat context assembly or the context AI contract as unimplemented priorities.
 
 Market context should be available before the AI makes a token decision. Social events alone are evidence, not a sufficient token decision trigger.
 
@@ -177,4 +177,13 @@ User workflow preference: always commit completed project changes after the rele
 - The assembler accepts only `ACCEPTED` and `!prefilter.rejected`. Market history path/byte offset identifies a context. On-chain uses exact mint + market fetch time only when unique across market history; keep opaque `marketRecordId`, never recompute it. Social uses the latest valid matching history revision, verifying original market reference, mint, fetch time and every event mint.
 - `data/analysis-contexts.jsonl` contains append-only full revisions. Preserve collection timestamps/source information, missing options and empty social arrays. Missing data is not a risk and never changes prefilter warnings. Do not add a volatile assembly timestamp that defeats identical-context suppression.
 - Reuse the incremental JSONL reader and local notifications; market writes wake both independent consumers, on-chain/social-context writes wake assembly. Restart rebuilds and suppresses identical latest contexts. Preserve all upstream behavior and the manual `/analyze` endpoint.
-- Current next priorities are evaluating evidence coverage, specifying explicit cost-controlled AI invocation, and measuring refresh/retention needs. Narrative, sentiment and influence interpretation are not deterministic assembly work.
+- Current next priorities are evaluating evidence coverage and manual AI quality before enabling automation, and measuring refresh/retention needs. Narrative, sentiment and influence interpretation are not deterministic assembly work.
+
+## Implemented explicit context AI
+
+- Reuse `AiAnalyst::analyze_context(&AnalysisContext)`, existing model/key/client and Responses API. Strict Structured Outputs lives under `text.format`; keep the eight AiDecision fields, required keys, `additionalProperties: false`, nullable narrative and confidence 0..100 validated in code. Never persist a decision from refusal/incomplete/invalid output.
+- `/analyze-context` accepts only `{contextOffset}` referencing a complete persisted context line, checks its original ACCEPTED market observation, and invokes the same service as automation. No new collection, score, thresholds or external tools. Legacy `/analyze` is unchanged.
+- Successful records append to `data/ai-analysis.jsonl` with context path/offset, mint, analyzedAt, model, stable contextHash and decision. Stable SHA-256 covers the typed evidence payload, not wall-clock time. Share one serialized service between manual and auto; successful duplicates return cached results.
+- Before requests, persist a durable entry in `data/ai-analysis-attempts.jsonl`; recover both histories after restart. At most one attempted send per context, including failures/cancellation. Uncertain or failed attempts are not automatically retried and return 409 on deliberate repeat. A damaged journal disables context AI only. Preserve these journals to retain cost protection.
+- Automation is opt-in (`AI_AUTO_ANALYSIS_ENABLED=false`). When enabled it consumes new context lines after startup EOF only, with one request in flight, 90s timeout, 4096 output-token cap and 60s cooldown after provider failure. No backlog replay, ranking or aggressive retries. Sources and HTTP continue independently.
+- Context evidence is the only factual source. Prompt instructions distinguish evidence from confirmation, repeated receipts from endorsements, uncertainty from risk and timestamps from inferred freshness. No invented narratives/influence, purchase amounts or deterministic substitute for reasoning. No live OpenAI calls in normal tests.

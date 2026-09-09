@@ -1,4 +1,5 @@
 pub mod context;
+pub mod context_ai;
 pub mod discovery;
 pub mod market;
 pub mod onchain;
@@ -323,6 +324,15 @@ impl JsonlStore {
     }
 
     pub async fn append<T: Serialize>(&self, value: &T) -> Result<()> {
+        self.append_inner(value, false).await
+    }
+
+    /// Persist cost-control journals before external requests can be sent.
+    pub async fn append_durable<T: Serialize>(&self, value: &T) -> Result<()> {
+        self.append_inner(value, true).await
+    }
+
+    async fn append_inner<T: Serialize>(&self, value: &T, durable: bool) -> Result<()> {
         let _guard = self.lock.lock().await;
 
         if let Some(parent) = self.path.parent() {
@@ -338,8 +348,11 @@ impl JsonlStore {
         let mut line = serde_json::to_vec(value)?;
         line.push(b'\n');
         file.write_all(&line).await?;
-        if !self.notify.is_empty() {
+        if durable || !self.notify.is_empty() {
             file.flush().await?;
+            if durable {
+                file.sync_data().await?;
+            }
             for notify in &self.notify {
                 notify.notify_one();
             }

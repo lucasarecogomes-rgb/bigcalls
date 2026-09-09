@@ -161,8 +161,10 @@ pub(crate) async fn run(
     social_history: PathBuf,
     output: PathBuf,
     notify: Arc<Notify>,
+    output_notify: Arc<Notify>,
 ) -> Result<()> {
     let mut assembler = Assembler::open(market, onchain, social, social_history, output).await?;
+    assembler.output = assembler.output.with_notify(output_notify);
     loop {
         assembler.reconcile().await?;
         notify.notified().await;

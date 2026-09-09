@@ -16,6 +16,10 @@ impl Tail {
         Self { path, offset: 0 }
     }
 
+    pub(crate) fn from_offset(path: PathBuf, offset: u64) -> Self {
+        Self { path, offset }
+    }
+
     pub(crate) async fn read_new(&mut self) -> Result<Vec<(u64, Value)>> {
         let file = match File::open(&self.path).await {
             Ok(file) => file,
