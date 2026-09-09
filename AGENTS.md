@@ -152,7 +152,7 @@ User workflow preference: always commit completed project changes after the rele
 - After exact-mint matching and deduplication, the market worker calls the existing `analyst_core::prefilter` with the application's shared `AnalystConfig` values. Keep provider normalization separate from this step; do not add rules or thresholds.
 - Each market-history record preserves the unmodified normalized `market` and adds `status` (`ACCEPTED`/`REJECTED`) plus the original `prefilter` result (`rejected`, `reasons`, `warnings`). Missing provider fields remain absent and cannot alone cause rejection.
 - Existing hard rejects only cover low liquidity and excessive top-10, creator or sniper holdings when available. Active mint/freeze authorities are warnings only. No market-cap filter, scoring or ranking.
-- Rejected records stop at the worker gate. Accepted records may enter the optional on-chain mint-context stage; no social/J7/narrative/AI work runs yet. Consumers must require explicit `ACCEPTED`; legacy records without status are unevaluated.
+- Rejected records stop at the worker gate. Accepted records may enter the optional on-chain mint-context stage and local J7 correlation; no narrative interpretation or AI work runs yet. Consumers must require explicit `ACCEPTED`; legacy records without status are unevaluated.
 - Do not rewrite historical records, change candidate storage or provider batching, or alter `/analyze` behavior for this integration.
 
 ## Implemented accepted-only mint context
@@ -160,3 +160,11 @@ User workflow preference: always commit completed project changes after the rele
 - `OnChainProvider` isolates optional Solana RPC collection. `SOLANA_RPC_URL` enables a separate bounded worker; preserve GMGN's existing batches and send only their accepted subset after market persistence. Verify `ACCEPTED` and `!prefilter.rejected` again before provider calls. No new risk decisions or rules.
 - One `getMultipleAccounts` request with `jsonParsed` / `confirmed` collects only recognized mint program owner and reported extension names, plus slot/source provenance. Do not duplicate GMGN holder/authority metrics or infer extension state, fees, LP safety, sniper/bundle percentages. Missing/unparsed data stays `None`.
 - Append to `data/onchain-snapshots.jsonl`, referencing the original market record by `record_id` hash and fetch time. No rewrites or automatic historical replay. Errors/full queue preserve accepted market history, with no per-token retries or blocking of discovery, GMGN or HTTP. Keep RPC URLs/credentials out of logs.
+
+## Implemented accepted-only social correlation
+
+- A separate local worker indexes existing market and J7 JSONL histories by exact case-sensitive contract (outer whitespace trimmed). Only explicit `ACCEPTED` with `prefilter.rejected == false` authorizes context. No ticker/name-only matches, new rules, scores, X requests or AI calls.
+- On startup, replay social and market histories; then use opt-in `JsonlStore` notifications after complete writes and incremental byte offsets. Notifications coalesce without losing durable inputs. No polling, scheduler, collector change or storage migration.
+- Append full context revisions to `data/social-contexts.jsonl`, keyed by the accepted market history path/byte offset and social history path. Preserve each complete `SocialIngestRecord` for provenance. No events is `socialEvents: []`; repeated receipts remain separate. Replaying unchanged inputs must not append identical latest contexts.
+- Social correlation is independent of optional on-chain success. Source histories and existing on-chain behavior remain unchanged. Future AI assembly can use the accepted history reference plus contract/fetch time; do not automatically invoke it.
+- This MVP assumes append-only stable history files, keeps an in-memory index and uses no time window or retention changes. I/O failure stops only this worker; restart rebuilds from the source histories.

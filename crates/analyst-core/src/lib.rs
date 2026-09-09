@@ -17,7 +17,7 @@ use sha2::{Digest, Sha256};
 use tokio::{
     fs::{self, OpenOptions},
     io::AsyncWriteExt,
-    sync::Mutex,
+    sync::{Mutex, Notify},
 };
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -107,7 +107,7 @@ pub struct AnalysisRecord {
     pub ai: Option<AiDecision>,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SocialIngestRecord {
     pub id: String,
@@ -303,6 +303,7 @@ fn extract_output_text(value: &serde_json::Value) -> Option<String> {
 pub struct JsonlStore {
     path: PathBuf,
     lock: Arc<Mutex<()>>,
+    notify: Option<Arc<Notify>>,
 }
 
 impl JsonlStore {
@@ -310,7 +311,14 @@ impl JsonlStore {
         Self {
             path: path.as_ref().to_path_buf(),
             lock: Arc::new(Mutex::new(())),
+            notify: None,
         }
+    }
+
+    /// Wake an optional local history consumer after a complete line is visible.
+    pub fn with_notify(mut self, notify: Arc<Notify>) -> Self {
+        self.notify = Some(notify);
+        self
     }
 
     pub async fn append<T: Serialize>(&self, value: &T) -> Result<()> {
@@ -329,6 +337,10 @@ impl JsonlStore {
         let mut line = serde_json::to_vec(value)?;
         line.push(b'\n');
         file.write_all(&line).await?;
+        if let Some(notify) = &self.notify {
+            file.flush().await?;
+            notify.notify_one();
+        }
         Ok(())
     }
 }

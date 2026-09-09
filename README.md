@@ -194,10 +194,65 @@ Each new line in `data/market-snapshots.jsonl` preserves the original normalized
 it is eligibility for future work, not an analyst verdict or a safety guarantee.
 `REJECTED` records retain all rejection reasons and stop at the worker's gate.
 Only explicitly accepted records may enter the optional mint-context stage below.
-No social, J7, narrative or AI stage is started for either status.
+Accepted records also authorize the local J7 correlation described below.
+No narrative interpretation or AI stage is started for either status.
 Future consumers must process only explicitly `ACCEPTED` records. Older history
 lines without a status remain unevaluated; they are not implicitly accepted or
 rewritten. Unmatched candidates remain only in discovery history.
+
+### Accepted-only social correlation
+
+One background worker correlates the existing market and J7 JSONL histories in
+memory, without API calls, SQLite, polling, a scheduler or changes to the collector.
+It starts even when discovery or the optional on-chain provider is disabled, so
+previously accepted market records can receive newly ingested social evidence.
+
+Only rows with explicit `status: ACCEPTED` and `prefilter.rejected: false` authorize
+a context. Rejected, inconsistent and legacy rows never authorize one. The worker
+does not rerun the prefilter or modify any decision. Each context belongs to its
+accepted market observation; a different rejected observation is never attached.
+
+Matching requires exact `contractAddress`, preserving case and trimming only outer
+whitespace. Ticker/name remain in the original event as metadata but are not used
+to generate matches. Events without a contract remain in J7 history, unassociated.
+No contract extraction from text/URLs or inference of sentiment, influence or
+narrative is performed. A match is identifier evidence, not verification of a post.
+
+Both arrival orders work:
+
+- Event first: index it by contract and attach it when an accepted record appears.
+- Acceptance first: append a context with `socialEvents: []`, then append a revised
+  context when matching events arrive. Empty means no observed matching events,
+  not proof of no social activity.
+
+After market or social persistence, `JsonlStore` sends a coalescing in-memory
+notification. The worker reads complete new lines from its byte offsets. Events
+are never carried in a lossy notification queue. On restart it rebuilds from
+`data/market-snapshots.jsonl` and `SOCIAL_HISTORY_PATH` (default
+`data/social-history.jsonl`), and avoids appending identical latest contexts.
+Incomplete final lines wait for completion; invalid complete JSON lines are
+skipped with a warning. No existing history is rewritten.
+
+Context revisions append to **`data/social-contexts.jsonl`**. Each contains:
+
+- `token`: contract, original market fetch time and `marketHistoryOffset` (byte
+  position of the authorizing ACCEPTED row).
+- `marketHistoryPath`, `socialHistoryPath` and `matchMethod: contractAddress`.
+- `socialEvents`: complete existing `SocialIngestRecord` objects, preserving
+  receipt ID/time and the full `SocialEvent`, including source, author, text,
+  original links and detection time when available.
+
+Use the last context for a `(marketHistoryPath, marketHistoryOffset,
+socialHistoryPath)` key. The reference recovers the original market/prefilter;
+contract and market fetch time also allow future association with on-chain
+observations. This task does not assemble or send an AI request.
+
+MVP limits: append-only files must retain their paths/order; rotation, truncation
+and external writers are not supported live. External additions are picked up on
+the next app notification or restart. Memory and full context revisions grow with
+history; no retention policy or time window is introduced. Repeated J7 receipts
+remain separate evidence, not independent endorsements. An I/O failure stops only
+correlation and is logged; source histories remain available for restart recovery.
 
 ### Accepted-only on-chain mint context
 

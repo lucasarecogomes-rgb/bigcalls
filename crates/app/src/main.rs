@@ -1,6 +1,7 @@
 mod discovery;
 mod market;
 mod onchain;
+mod social;
 
 use std::{env, net::SocketAddr, sync::Arc};
 
@@ -61,15 +62,16 @@ async fn main() -> anyhow::Result<()> {
             AiAnalyst::new(api_key, model)
         });
 
+    let social_notify = Arc::new(tokio::sync::Notify::new());
+    let social_history_path =
+        env::var("SOCIAL_HISTORY_PATH").unwrap_or_else(|_| "data/social-history.jsonl".into());
     let state = Arc::new(AppState {
         ai,
         analysis_store: JsonlStore::new(
             env::var("ANALYSIS_HISTORY_PATH")
                 .unwrap_or_else(|_| "data/analysis-history.jsonl".into()),
         ),
-        social_store: JsonlStore::new(
-            env::var("SOCIAL_HISTORY_PATH").unwrap_or_else(|_| "data/social-history.jsonl".into()),
-        ),
+        social_store: JsonlStore::new(&social_history_path).with_notify(social_notify.clone()),
         config: AnalystConfig::from_env(),
     });
 
@@ -80,6 +82,19 @@ async fn main() -> anyhow::Result<()> {
         .with_state(state.clone());
 
     let listener = tokio::net::TcpListener::bind(bind_addr).await?;
+    let social_wake = social_notify.clone();
+    let social_task = tokio::spawn(async move {
+        if let Err(error) = social::run(
+            "data/market-snapshots.jsonl".into(),
+            social_history_path.into(),
+            "data/social-contexts.jsonl".into(),
+            social_wake,
+        )
+        .await
+        {
+            warn!(error = %error, "social correlation stopped; source histories remain preserved");
+        }
+    });
     let market_provider = if discovery_enabled {
         env::var("GMGN_API_KEY")
             .ok()
@@ -116,7 +131,7 @@ async fn main() -> anyhow::Result<()> {
         let config = state.config.clone();
         let task = tokio::spawn(async move {
             info!("GMGN read-only market enrichment enabled");
-            if let Err(error) = market::run(provider, rx, JsonlStore::new("data/market-snapshots.jsonl"), config, onchain_sink).await {
+            if let Err(error) = market::run(provider, rx, JsonlStore::new("data/market-snapshots.jsonl").with_notify(social_notify), config, onchain_sink).await {
                 warn!(error = %error, "market enrichment stopped; discovery and HTTP remain available");
             }
         });
@@ -147,6 +162,7 @@ async fn main() -> anyhow::Result<()> {
     if let Some(task) = onchain_task {
         task.abort();
     }
+    social_task.abort();
     result?;
     Ok(())
 }
