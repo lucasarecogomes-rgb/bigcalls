@@ -1,5 +1,6 @@
 mod discovery;
 mod market;
+mod onchain;
 
 use std::{env, net::SocketAddr, sync::Arc};
 
@@ -93,12 +94,29 @@ async fn main() -> anyhow::Result<()> {
     } else {
         None
     };
+    let (onchain_sink, onchain_task) = if market_provider.is_some() {
+        env::var("SOLANA_RPC_URL").ok().filter(|url| !url.trim().is_empty())
+            .and_then(|url| match analyst_core::onchain::solana::SolanaRpcProvider::new(&url) {
+                Ok(provider) => {
+                    let (tx, rx) = tokio::sync::mpsc::channel(8);
+                    let task = tokio::spawn(async move {
+                        if let Err(error) = onchain::run(provider, rx, JsonlStore::new("data/onchain-snapshots.jsonl")).await {
+                            warn!(error = %error, "on-chain worker stopped; market enrichment and HTTP remain available");
+                        }
+                    });
+                    Some((tx, task))
+                }
+                Err(error) => { warn!(error = %error, "on-chain provider disabled"); None }
+            }).unzip()
+    } else {
+        (None, None)
+    };
     let (market_sink, market_task) = market_provider.map(|provider| {
         let (tx, rx) = tokio::sync::mpsc::channel(256);
         let config = state.config.clone();
         let task = tokio::spawn(async move {
             info!("GMGN read-only market enrichment enabled");
-            if let Err(error) = market::run(provider, rx, JsonlStore::new("data/market-snapshots.jsonl"), config).await {
+            if let Err(error) = market::run(provider, rx, JsonlStore::new("data/market-snapshots.jsonl"), config, onchain_sink).await {
                 warn!(error = %error, "market enrichment stopped; discovery and HTTP remain available");
             }
         });
@@ -124,6 +142,9 @@ async fn main() -> anyhow::Result<()> {
         task.abort();
     }
     if let Some(task) = market_task {
+        task.abort();
+    }
+    if let Some(task) = onchain_task {
         task.abort();
     }
     result?;

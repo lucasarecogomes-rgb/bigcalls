@@ -1,5 +1,6 @@
 pub mod discovery;
 pub mod market;
+pub mod onchain;
 
 use std::{
     env,

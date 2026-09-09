@@ -152,5 +152,11 @@ User workflow preference: always commit completed project changes after the rele
 - After exact-mint matching and deduplication, the market worker calls the existing `analyst_core::prefilter` with the application's shared `AnalystConfig` values. Keep provider normalization separate from this step; do not add rules or thresholds.
 - Each market-history record preserves the unmodified normalized `market` and adds `status` (`ACCEPTED`/`REJECTED`) plus the original `prefilter` result (`rejected`, `reasons`, `warnings`). Missing provider fields remain absent and cannot alone cause rejection.
 - Existing hard rejects only cover low liquidity and excessive top-10, creator or sniper holdings when available. Active mint/freeze authorities are warnings only. No market-cap filter, scoring or ranking.
-- Rejected records stop at the worker gate. Accepted records are merely eligible for later stages; no downstream social/J7/on-chain/narrative/AI work runs yet. Future consumers must require explicit `ACCEPTED`; legacy records without status are unevaluated.
+- Rejected records stop at the worker gate. Accepted records may enter the optional on-chain mint-context stage; no social/J7/narrative/AI work runs yet. Consumers must require explicit `ACCEPTED`; legacy records without status are unevaluated.
 - Do not rewrite historical records, change candidate storage or provider batching, or alter `/analyze` behavior for this integration.
+
+## Implemented accepted-only mint context
+
+- `OnChainProvider` isolates optional Solana RPC collection. `SOLANA_RPC_URL` enables a separate bounded worker; preserve GMGN's existing batches and send only their accepted subset after market persistence. Verify `ACCEPTED` and `!prefilter.rejected` again before provider calls. No new risk decisions or rules.
+- One `getMultipleAccounts` request with `jsonParsed` / `confirmed` collects only recognized mint program owner and reported extension names, plus slot/source provenance. Do not duplicate GMGN holder/authority metrics or infer extension state, fees, LP safety, sniper/bundle percentages. Missing/unparsed data stays `None`.
+- Append to `data/onchain-snapshots.jsonl`, referencing the original market record by `record_id` hash and fetch time. No rewrites or automatic historical replay. Errors/full queue preserve accepted market history, with no per-token retries or blocking of discovery, GMGN or HTTP. Keep RPC URLs/credentials out of logs.

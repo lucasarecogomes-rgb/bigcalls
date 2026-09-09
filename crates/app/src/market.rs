@@ -7,7 +7,7 @@ use chrono::{DateTime, Utc};
 use serde::Serialize;
 use std::{collections::HashSet, time::Duration};
 use tokio::{
-    sync::mpsc::Receiver,
+    sync::mpsc::{Receiver, Sender},
     time::{timeout_at, Instant},
 };
 use tracing::{info, warn};
@@ -17,17 +17,17 @@ const BATCH_WINDOW: Duration = Duration::from_secs(5);
 
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
-struct MarketEnrichmentRecord {
-    discovered_at: DateTime<Utc>,
-    fetched_at: DateTime<Utc>,
-    market: MarketSnapshot,
-    status: PrefilterStatus,
-    prefilter: PrefilterResult,
+pub(crate) struct MarketEnrichmentRecord {
+    pub(crate) discovered_at: DateTime<Utc>,
+    pub(crate) fetched_at: DateTime<Utc>,
+    pub(crate) market: MarketSnapshot,
+    pub(crate) status: PrefilterStatus,
+    pub(crate) prefilter: PrefilterResult,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, PartialEq, Eq)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
-enum PrefilterStatus {
+pub(crate) enum PrefilterStatus {
     Accepted,
     Rejected,
 }
@@ -37,8 +37,9 @@ pub async fn run(
     candidates: Receiver<TokenCandidate>,
     store: JsonlStore,
     config: AnalystConfig,
+    onchain: Option<Sender<Vec<MarketEnrichmentRecord>>>,
 ) -> anyhow::Result<()> {
-    run_batches(provider, candidates, store, config, BATCH_WINDOW).await
+    run_batches(provider, candidates, store, config, BATCH_WINDOW, onchain).await
 }
 
 async fn run_batches(
@@ -47,6 +48,7 @@ async fn run_batches(
     store: JsonlStore,
     config: AnalystConfig,
     window: Duration,
+    onchain: Option<Sender<Vec<MarketEnrichmentRecord>>>,
 ) -> anyhow::Result<()> {
     while let Some(first) = candidates.recv().await {
         let mut batch = vec![first];
@@ -60,6 +62,7 @@ async fn run_batches(
         // Exactly one bulk call; never fall back to token/info for misses.
         match provider.fetch_markets(&batch).await {
             Ok(markets) => {
+                let mut accepted = Vec::new();
                 let mut saved = HashSet::new();
                 let fetched_at = Utc::now();
                 for market in markets {
@@ -89,7 +92,16 @@ async fn run_batches(
                     if record.prefilter.rejected {
                         continue;
                     }
-                    // ACCEPTED is eligible for future enrichment only. No downstream work yet.
+                    if record.status == PrefilterStatus::Accepted {
+                        accepted.push(record);
+                    }
+                }
+                if let Some(sink) = &onchain {
+                    if !accepted.is_empty() && sink.try_send(accepted).is_err() {
+                        warn!(
+                            "on-chain queue unavailable; accepted market history remains preserved"
+                        );
+                    }
                 }
                 info!(
                     candidates = batch.len(),
@@ -255,15 +267,23 @@ mod tests {
             ..MarketSnapshot::default()
         });
         let file = path();
+        let (onchain_tx, mut onchain_rx) = mpsc::channel(1);
         run_batches(
             SnapshotProvider(returned),
             rx,
             JsonlStore::new(&file),
             config.clone(),
             BATCH_WINDOW,
+            Some(onchain_tx),
         )
         .await
         .unwrap();
+        let accepted = onchain_rx.recv().await.unwrap();
+        assert_eq!(accepted.len(), 2);
+        assert!(accepted
+            .iter()
+            .all(|r| r.status == PrefilterStatus::Accepted && !r.prefilter.rejected));
+        assert!(onchain_rx.recv().await.is_none());
         let history = tokio::fs::read_to_string(&file).await.unwrap();
         tokio::fs::remove_file(&file).await.unwrap();
         let records: Vec<serde_json::Value> = history
@@ -331,6 +351,7 @@ mod tests {
             JsonlStore::new(&file),
             AnalystConfig::default(),
             BATCH_WINDOW,
+            None,
         )
         .await
         .unwrap();
@@ -364,6 +385,7 @@ mod tests {
             JsonlStore::new(&file),
             AnalystConfig::default(),
             BATCH_WINDOW,
+            None,
         )
         .await
         .unwrap();
@@ -388,6 +410,7 @@ mod tests {
             JsonlStore::new(path()),
             AnalystConfig::default(),
             Duration::from_millis(30),
+            None,
         ));
         tokio::time::sleep(Duration::from_millis(50)).await;
         assert!(calls.lock().unwrap().is_empty());
@@ -420,7 +443,8 @@ mod tests {
                 rx,
                 JsonlStore::new(std::env::temp_dir()),
                 AnalystConfig::default(),
-                BATCH_WINDOW
+                BATCH_WINDOW,
+                None
             )
             .await
             .is_err());

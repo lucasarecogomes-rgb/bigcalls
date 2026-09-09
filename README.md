@@ -193,10 +193,64 @@ Each new line in `data/market-snapshots.jsonl` preserves the original normalized
 `ACCEPTED` means no configured hard reject was found, even with incomplete data;
 it is eligibility for future work, not an analyst verdict or a safety guarantee.
 `REJECTED` records retain all rejection reasons and stop at the worker's gate.
-No social, J7, narrative, on-chain or AI stage is started for either status.
+Only explicitly accepted records may enter the optional mint-context stage below.
+No social, J7, narrative or AI stage is started for either status.
 Future consumers must process only explicitly `ACCEPTED` records. Older history
 lines without a status remain unevaluated; they are not implicitly accepted or
 rewritten. Unmatched candidates remain only in discovery history.
+
+### Accepted-only on-chain mint context
+
+Gap audit before adding a source:
+
+- GMGN already supplies holders, top-10/creator percentages and mint/freeze
+  authority flags when available. These are not queried or copied again.
+- Overall sniper/bundled holding percentages remain unknown; counts and trading
+  volume are not equivalents. Pool-specific liquidity lock/burn evidence and
+  mint extension capabilities were not supplied by our market snapshot.
+- Missing 5m/1h volume is a market-data gap, outside this stage.
+
+The smallest additional source is Solana's read-only RPC behind `OnChainProvider`.
+Set `SOLANA_RPC_URL` to a mainnet RPC endpoint to enable it; blank disables it.
+Keep any credentials in the URL outside the repository. No new dependency or
+default public-RPC traffic is introduced.
+
+After market history is saved, the accepted subset of each existing GMGN batch
+is sent through a bounded queue (eight batches). A separate worker makes one
+`getMultipleAccounts` call per available nonempty batch, with `jsonParsed` and
+`confirmed` commitment. No per-token retries or new batching timer. The worker
+independently requires both `ACCEPTED` and `prefilter.rejected == false` before
+calling the provider. It neither reruns nor changes the prefilter.
+
+New data is limited to `tokenProgram` (recognized mint program owner) and
+`reportedExtensions` (extension names reported by the RPC decoder). Mint address,
+RPC context slot, source, commitment and local observation time provide provenance.
+No extension states, fees, delegate addresses or safety verdicts are inferred.
+Absent/unparsed/non-mint accounts leave the new fields `None`; omitted extension
+lists remain `None`, and an explicitly empty list remains empty. Reported names
+do not establish complete extension coverage or whether a capability is active.
+
+Results append to `data/onchain-snapshots.jsonl` with `marketRecordId` (the existing
+`record_id` hash of the input record), `marketFetchedAt`, `observedAt` and `onChain`.
+Market and candidate histories are unchanged. Existing historical records are
+not replayed automatically. Queue overflow, closed worker or RPC failure leaves
+the accepted market record available for future reevaluation; no synthetic
+on-chain result is written on request failure. HTTP/RPC errors use cooldown,
+requests have 5s connection / 10s overall timeouts, and storage failure stops only
+this worker. Neither credentials nor raw RPC errors are logged.
+
+Still missing: global sniper/bundled holdings, pool-specific LP lock/burn evidence,
+effective extension configuration and any GMGN metrics missing for an individual
+token. No new fields are invented for these gaps, and they cause no new decision.
+
+Official contract references checked before implementation:
+[Solana getMultipleAccounts](https://solana.com/docs/rpc/http/getmultipleaccounts)
+documents up to 100 addresses and response order;
+[Agave mint decoder](https://github.com/anza-xyz/agave/blob/master/account-decoder/src/parse_token.rs)
+and [JSON types](https://github.com/anza-xyz/agave/blob/master/account-decoder-client-types/src/token.rs)
+define parsed mint extension names;
+[Solana extensions](https://solana.com/docs/tokens/extensions)
+explains the capabilities. The implementation collects reported names only.
 
 ### Failure handling and verification
 
